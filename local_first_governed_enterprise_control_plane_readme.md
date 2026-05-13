@@ -1,4 +1,4 @@
-# Local-First Governed Enterprise Control Plane
+# Enterprise-Data-Access-and-Relationship-Graph-Architecture
 
 A security-first architecture for mapping enterprise authority, operational objects, workflow actions, and AI-assisted feedback loops without centralizing sensitive context inside a third-party SaaS platform.
 
