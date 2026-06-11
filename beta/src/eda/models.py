@@ -96,8 +96,10 @@ class ObjectNode(Base):
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
     kind: Mapped[str] = mapped_column(String(40), index=True)
     name: Mapped[str] = mapped_column(String(200), index=True)
-    # attrs may include: environment, classification (public|internal|sensitive), owner
+    # attrs may include: environment, classification (public|internal|sensitive),
+    # owner, restricted_fields (attr keys redacted for non-root views)
     attrs: Mapped[dict] = mapped_column(JSON, default=dict)
+    tenant_id: Mapped[str | None] = mapped_column(String(120), nullable=True, index=True)
 
 
 class ObjectEdge(Base):
@@ -116,13 +118,23 @@ class ObjectEdge(Base):
 # 2. Policy Engine: versioned policy documents
 # --------------------------------------------------------------------------
 class PolicyRecord(Base):
+    """Versioned policy document with a controlled lifecycle.
+
+    status: draft -> active -> retired. Activation happens only through the
+    policy service (validated, audited); `checksum` covers the document so a
+    direct database edit of an active policy fails closed at evaluation time.
+    """
+
     __tablename__ = "policy_records"
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
     version: Mapped[str] = mapped_column(String(60), unique=True)
     document: Mapped[dict] = mapped_column(JSON)
-    active: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    status: Mapped[str] = mapped_column(String(20), default="draft", index=True)
+    checksum: Mapped[str] = mapped_column(String(64))
+    created_by: Mapped[str] = mapped_column(String(200), default="system")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 # --------------------------------------------------------------------------
@@ -136,29 +148,50 @@ class Grant(Base):
     scope: Mapped[dict] = mapped_column(JSON)  # {actions, resources, read_only}
     session_tags: Mapped[dict] = mapped_column(JSON, default=dict)
     broker_kind: Mapped[str] = mapped_column(String(40))  # mock_sts | aws_sts | ...
-    credentials: Mapped[dict] = mapped_column(JSON)  # NEVER returned for high-risk actions
+    # Opaque vault reference. Usable credential material is never persisted in
+    # the control-plane database; it lives in the broker's credential vault
+    # and is released only to the executor (or confined to the controlled
+    # runner) for the grant's lifetime.
+    credential_ref: Mapped[str] = mapped_column(String(64))
     issued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     revoked: Mapped[bool] = mapped_column(Boolean, default=False)
     correlation_id: Mapped[str] = mapped_column(String(32), index=True)
+    tenant_id: Mapped[str | None] = mapped_column(String(120), nullable=True, index=True)
 
 
 # --------------------------------------------------------------------------
 # Approvals (used by Policy Engine require_approval decisions)
 # --------------------------------------------------------------------------
 class Approval(Base):
+    """A pending/decided approval, bound to one exact request.
+
+    `required_capability` is server-derived ("approval:<action>") - clients
+    never supply it. Approving requires a proven access path showing the
+    approver holds that capability for the target resource; the path is
+    preserved as `approver_path` evidence. Approvals expire, and are consumed
+    atomically exactly once (status: pending -> approved -> consumed).
+    """
+
     __tablename__ = "approvals"
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
     subject: Mapped[str] = mapped_column(String(200))
     action: Mapped[str] = mapped_column(String(100))
     resource: Mapped[str] = mapped_column(String(200))
+    inputs_hash: Mapped[str] = mapped_column(String(64), default="")
+    required_capability: Mapped[str] = mapped_column(String(120))
     justification: Mapped[dict] = mapped_column(JSON, default=dict)
-    status: Mapped[str] = mapped_column(String(20), default="pending")  # pending|approved|rejected
+    # pending | approved | rejected | consumed
+    status: Mapped[str] = mapped_column(String(20), default="pending")
     approver: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    approver_path: Mapped[list | None] = mapped_column(JSON, nullable=True)
     decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     correlation_id: Mapped[str] = mapped_column(String(32), index=True)
+    tenant_id: Mapped[str | None] = mapped_column(String(120), nullable=True, index=True)
 
 
 # --------------------------------------------------------------------------
@@ -170,6 +203,7 @@ class AuditRecord(Base):
     seq: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     id: Mapped[str] = mapped_column(String(32), unique=True, default=_uuid)
     correlation_id: Mapped[str] = mapped_column(String(32), index=True)
+    tenant_id: Mapped[str | None] = mapped_column(String(120), nullable=True, index=True)
     ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     subject: Mapped[str] = mapped_column(String(200), index=True)
     session_id: Mapped[str] = mapped_column(String(64))
@@ -186,7 +220,9 @@ class AuditRecord(Base):
     context_summary: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     result: Mapped[str] = mapped_column(String(40))  # allowed|denied|approval_required|error|...
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
-    prev_hash: Mapped[str] = mapped_column(String(64))
+    # unique: a database-level backstop against forked chain heads - two
+    # concurrent appends can never share the same predecessor.
+    prev_hash: Mapped[str] = mapped_column(String(64), unique=True)
     hash: Mapped[str] = mapped_column(String(64), unique=True)
 
 
@@ -202,4 +238,19 @@ class Recommendation(Base):
     details: Mapped[dict] = mapped_column(JSON, default=dict)
     status: Mapped[str] = mapped_column(String(20), default="proposed")  # proposed|approved|rejected
     decided_by: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    tenant_id: Mapped[str | None] = mapped_column(String(120), nullable=True, index=True)
+
+
+class IngestReceipt(Base):
+    """Idempotency record for collector batches: replaying the same
+    Idempotency-Key returns the original summary without reapplying."""
+
+    __tablename__ = "ingest_receipts"
+    __table_args__ = (UniqueConstraint("source_id", "idempotency_key"),)
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    source_id: Mapped[str] = mapped_column(String(120), index=True)
+    idempotency_key: Mapped[str] = mapped_column(String(200))
+    summary: Mapped[dict] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

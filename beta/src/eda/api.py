@@ -1,16 +1,24 @@
 """HTTP API: each component exposed under its own prefix, plus the governed
 request flow at POST /requests.
 
+Administrative surfaces (policy, access-graph, audit, feedback, metrics) are
+capability-gated: authentication alone is insufficient; the caller's principal
+must hold a proven "admin:<area>:<verb>" capability path to the control-plane
+resource. Tenant-scoped data (audit records, recommendations) is filtered to
+the caller's tenant.
+
 Run:  uvicorn eda.api:app --reload
 Docs: http://127.0.0.1:8000/docs
 """
 
+import threading
+from collections import Counter
 from contextlib import asynccontextmanager
 from datetime import datetime
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import or_, select, text
 from sqlalchemy.orm import Session
 
 from . import access_graph, actions, audit, feedback, gateway, identity, ingestion, policy
@@ -39,6 +47,24 @@ def _verified_principal(db: Session, authorization: str | None):
     return session, principal
 
 
+def _require_capability(db: Session, principal, capability: str):
+    """Admin surfaces need a proven capability path, not just authentication."""
+    path = access_graph.capability_path(
+        db, principal.name, capability, "control-plane", tenant=principal.tenant_id
+    )
+    if path is None:
+        raise HTTPException(
+            403, f"requires capability {capability!r} on the control plane"
+        )
+    return path
+
+
+def _admin(db: Session, authorization: str | None, capability: str):
+    _, principal = _verified_principal(db, authorization)
+    _require_capability(db, principal, capability)
+    return principal
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
@@ -55,6 +81,40 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
+
+# ---- Minimal operational telemetry: request counters ------------------------
+_metrics_lock = threading.Lock()
+_request_counts: Counter = Counter()
+
+
+@app.middleware("http")
+async def _count_requests(request: Request, call_next):
+    response = await call_next(request)
+    with _metrics_lock:
+        _request_counts[(request.method, request.url.path, response.status_code)] += 1
+    return response
+
+
+# ---- Health (unauthenticated liveness/readiness) -----------------------------
+@app.get("/healthz", tags=["ops"])
+def healthz():
+    return {"status": "ok"}
+
+
+@app.get("/readyz", tags=["ops"])
+def readyz(db: Session = Depends(get_session)):
+    db.execute(text("SELECT 1"))
+    return {"status": "ready"}
+
+
+@app.get("/metrics", tags=["ops"])
+def metrics(db: Session = Depends(get_session), authorization: str | None = Header(default=None)):
+    _admin(db, authorization, "admin:metrics:read")
+    with _metrics_lock:
+        return [
+            {"method": m, "path": p, "status": s, "count": c}
+            for (m, p, s), c in sorted(_request_counts.items())
+        ]
 
 
 # ---- Identity ----------------------------------------------------------------
@@ -78,28 +138,92 @@ def create_session(body: SessionRequest):
     return {"session_token": token}
 
 
-# ---- Access Graph -----------------------------------------------------------
+# ---- Access Graph (admin) -----------------------------------------------------
 @app.get("/access-graph/path", tags=["access-graph"])
-def get_path(subject: str, action: str, resource: str, db: Session = Depends(get_session)):
+def get_path(
+    subject: str, action: str, resource: str,
+    db: Session = Depends(get_session),
+    authorization: str | None = Header(default=None),
+):
+    _admin(db, authorization, "admin:access-graph:read")
     path = access_graph.resolve_path(db, subject, action, resource)
     if path is None:
         return {"exists": False, "hops": [], "allowed_actions": []}
     return {"exists": True, "hops": path.hops, "allowed_actions": path.allowed_actions}
 
 
-# ---- Policy Engine ----------------------------------------------------------
+# ---- Policy Engine (admin) ------------------------------------------------------
 @app.get("/policy/active", tags=["policy"])
-def get_active_policy(db: Session = Depends(get_session)):
+def get_active_policy(
+    db: Session = Depends(get_session), authorization: str | None = Header(default=None)
+):
+    _admin(db, authorization, "admin:policy:read")
     record = policy.active_policy(db)
-    return {"version": record.version, "document": record.document}
+    return {"version": record.version, "status": record.status,
+            "checksum": record.checksum, "document": record.document}
 
 
 @app.post("/policy/evaluate", tags=["policy"])
-def evaluate_policy(policy_input: dict, db: Session = Depends(get_session)):
+def evaluate_policy(
+    policy_input: dict,
+    db: Session = Depends(get_session),
+    authorization: str | None = Header(default=None),
+):
+    _admin(db, authorization, "admin:policy:read")
     return policy.evaluate(db, policy_input).as_json()
 
 
-# ---- Action registry --------------------------------------------------------
+class PolicyProposal(BaseModel):
+    document: dict
+
+
+@app.post("/policy/versions", tags=["policy"])
+def propose_policy_version(
+    body: PolicyProposal,
+    db: Session = Depends(get_session),
+    authorization: str | None = Header(default=None),
+):
+    principal = _admin(db, authorization, "admin:policy:write")
+    try:
+        record = policy.propose_policy(db, body.document, actor=principal.name)
+        db.commit()
+    except policy.PolicyError as exc:
+        db.rollback()
+        raise HTTPException(422, str(exc))
+    return {"version": record.version, "status": record.status, "checksum": record.checksum}
+
+
+@app.post("/policy/versions/{version}/activate", tags=["policy"])
+def activate_policy_version(
+    version: str,
+    db: Session = Depends(get_session),
+    authorization: str | None = Header(default=None),
+):
+    principal = _admin(db, authorization, "admin:policy:activate")
+    try:
+        record = policy.activate_policy(db, version, actor=principal.name)
+        db.commit()
+    except policy.PolicyError as exc:
+        db.rollback()
+        raise HTTPException(422, str(exc))
+    return {"version": record.version, "status": record.status}
+
+
+@app.post("/policy/rollback", tags=["policy"])
+def rollback_policy_version(
+    db: Session = Depends(get_session), authorization: str | None = Header(default=None)
+):
+    principal = _admin(db, authorization, "admin:policy:activate")
+    try:
+        record = policy.rollback_policy(db, actor=principal.name)
+        db.commit()
+    except policy.PolicyError as exc:
+        db.rollback()
+        raise HTTPException(422, str(exc))
+    return {"version": record.version, "status": record.status}
+
+
+# ---- Action registry (open catalog of controlled verbs) -------------------------
 @app.get("/actions", tags=["actions"])
 def list_actions():
     return [
@@ -110,7 +234,10 @@ def list_actions():
             "read_only": a.read_only,
             "risk": a.risk,
             "blast_radius": a.blast_radius,
-            "required_inputs": list(a.required_inputs),
+            "resource_kinds": list(a.resource_kinds),
+            "provider": a.provider,
+            "inputs_schema": a.input_model.model_json_schema(),
+            "allowed_outputs": list(a.allowed_outputs),
             "rollback": a.rollback,
         }
         for a in actions.REGISTRY.values()
@@ -157,12 +284,13 @@ def decide_approval(
 ):
     _, approver = _verified_principal(db, authorization)
     try:
-        record = gateway.decide_approval(
-            db, approval_id, approver=approver.name, approve=body.approve
-        )
+        record = gateway.decide_approval(db, approval_id, approver=approver, approve=body.approve)
+    except PermissionError as exc:
+        raise HTTPException(403, str(exc))
     except ValueError as exc:
         raise HTTPException(400, str(exc))
-    return {"approval_id": record.id, "status": record.status, "approver": record.approver}
+    return {"approval_id": record.id, "status": record.status, "approver": record.approver,
+            "approver_path": record.approver_path}
 
 
 # ---- Relationship ingestion (collector endpoint) ------------------------------
@@ -189,15 +317,22 @@ def ingest_relationships(
     body: RelationshipBatch,
     db: Session = Depends(get_session),
     authorization: str | None = Header(default=None),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ):
     try:
         source = ingestion.authenticate_collector(db, source_id, _bearer(authorization))
+        if idempotency_key:
+            replay = ingestion.find_receipt(db, source_id, idempotency_key)
+            if replay is not None:
+                return {**replay.summary, "idempotent_replay": True}
         summary = ingestion.ingest(
             db,
             source=source,
             relationships=[r.model_dump() for r in body.relationships],
             observed_at=body.observed_at,
         )
+        if idempotency_key:
+            ingestion.store_receipt(db, source_id, idempotency_key, summary)
         db.commit()
     except ingestion.IngestError as exc:
         db.rollback()
@@ -205,10 +340,25 @@ def ingest_relationships(
     return summary
 
 
-# ---- Audit / Evidence ----------------------------------------------------------
+# ---- Audit / Evidence (admin, tenant-scoped) ------------------------------------
+def _tenant_filter(query, principal):
+    return query.where(
+        or_(AuditRecord.tenant_id == principal.tenant_id, AuditRecord.tenant_id.is_(None))
+    )
+
+
 @app.get("/audit/records", tags=["audit"])
-def list_audit(limit: int = 50, db: Session = Depends(get_session)):
-    rows = db.scalars(select(AuditRecord).order_by(AuditRecord.seq.desc()).limit(limit)).all()
+def list_audit(
+    limit: int = 50,
+    db: Session = Depends(get_session),
+    authorization: str | None = Header(default=None),
+):
+    principal = _admin(db, authorization, "admin:audit:read")
+    rows = db.scalars(
+        _tenant_filter(select(AuditRecord), principal)
+        .order_by(AuditRecord.seq.desc())
+        .limit(limit)
+    ).all()
     return [
         {
             "seq": r.seq,
@@ -220,6 +370,7 @@ def list_audit(limit: int = 50, db: Session = Depends(get_session)):
             "target": r.target,
             "result": r.result,
             "policy_version": r.policy_version,
+            "tenant_id": r.tenant_id,
             "hash": r.hash,
         }
         for r in rows
@@ -227,9 +378,16 @@ def list_audit(limit: int = 50, db: Session = Depends(get_session)):
 
 
 @app.get("/audit/records/{correlation_id}", tags=["audit"])
-def get_audit_chain(correlation_id: str, db: Session = Depends(get_session)):
+def get_audit_chain(
+    correlation_id: str,
+    db: Session = Depends(get_session),
+    authorization: str | None = Header(default=None),
+):
+    principal = _admin(db, authorization, "admin:audit:read")
     rows = db.scalars(
-        select(AuditRecord).where(AuditRecord.correlation_id == correlation_id).order_by(AuditRecord.seq)
+        _tenant_filter(
+            select(AuditRecord).where(AuditRecord.correlation_id == correlation_id), principal
+        ).order_by(AuditRecord.seq)
     ).all()
     if not rows:
         raise HTTPException(404, "no audit records for that correlation id")
@@ -240,13 +398,38 @@ def get_audit_chain(correlation_id: str, db: Session = Depends(get_session)):
 
 
 @app.get("/audit/verify", tags=["audit"])
-def verify_audit(db: Session = Depends(get_session)):
+def verify_audit(
+    db: Session = Depends(get_session), authorization: str | None = Header(default=None)
+):
+    _admin(db, authorization, "admin:audit:read")
     return audit.verify_chain(db)
 
 
-# ---- Local AI Feedback Loop ------------------------------------------------------
+@app.post("/audit/anchors", tags=["audit"])
+def create_anchor(
+    db: Session = Depends(get_session), authorization: str | None = Header(default=None)
+):
+    _admin(db, authorization, "admin:audit:anchor")
+    try:
+        return audit.anchor_chain(db)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc))
+
+
+@app.get("/audit/anchors/verify", tags=["audit"])
+def verify_anchors(
+    db: Session = Depends(get_session), authorization: str | None = Header(default=None)
+):
+    _admin(db, authorization, "admin:audit:read")
+    return audit.verify_anchors(db)
+
+
+# ---- Local AI Feedback Loop (admin, tenant-scoped) ---------------------------------
 @app.post("/feedback/run", tags=["feedback"])
-def run_feedback(db: Session = Depends(get_session)):
+def run_feedback(
+    db: Session = Depends(get_session), authorization: str | None = Header(default=None)
+):
+    _admin(db, authorization, "admin:feedback:run")
     proposals = feedback.run_analyzers(db)
     db.commit()
     return [
@@ -255,8 +438,16 @@ def run_feedback(db: Session = Depends(get_session)):
 
 
 @app.get("/feedback/recommendations", tags=["feedback"])
-def list_recommendations(db: Session = Depends(get_session)):
-    rows = db.scalars(select(Recommendation).order_by(Recommendation.created_at)).all()
+def list_recommendations(
+    db: Session = Depends(get_session), authorization: str | None = Header(default=None)
+):
+    principal = _admin(db, authorization, "admin:feedback:read")
+    rows = db.scalars(
+        select(Recommendation)
+        .where(or_(Recommendation.tenant_id == principal.tenant_id,
+                   Recommendation.tenant_id.is_(None)))
+        .order_by(Recommendation.created_at)
+    ).all()
     return [
         {"id": r.id, "kind": r.kind, "summary": r.summary, "status": r.status,
          "decided_by": r.decided_by}
@@ -275,9 +466,9 @@ def decide_recommendation(
     db: Session = Depends(get_session),
     authorization: str | None = Header(default=None),
 ):
-    _, approver = _verified_principal(db, authorization)
+    principal = _admin(db, authorization, "admin:feedback:decide")
     try:
-        rec = feedback.decide(db, rec_id, approver=approver.name, approve=body.approve)
+        rec = feedback.decide(db, rec_id, approver=principal.name, approve=body.approve)
         db.commit()
     except ValueError as exc:
         raise HTTPException(400, str(exc))

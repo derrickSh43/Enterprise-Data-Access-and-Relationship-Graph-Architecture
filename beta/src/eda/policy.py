@@ -111,13 +111,164 @@ class Decision:
         }
 
 
+class PolicyError(Exception):
+    pass
+
+
+def checksum(document: dict) -> str:
+    canonical = json.dumps(document, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
 def active_policy(db: Session) -> PolicyRecord:
-    record = db.scalar(select(PolicyRecord).where(PolicyRecord.active.is_(True)))
+    record = db.scalar(select(PolicyRecord).where(PolicyRecord.status == "active"))
     if record is None:
-        record = PolicyRecord(version=DEFAULT_POLICY["version"], document=DEFAULT_POLICY, active=True)
+        record = PolicyRecord(
+            version=DEFAULT_POLICY["version"],
+            document=DEFAULT_POLICY,
+            status="active",
+            checksum=checksum(DEFAULT_POLICY),
+            created_by="system",
+        )
         db.add(record)
         db.flush()
+    # Fail closed if the active document was edited outside the lifecycle
+    # (e.g. directly in the database): the stored checksum no longer matches.
+    if record.checksum != checksum(record.document):
+        raise PolicyError(
+            f"active policy {record.version!r} failed integrity check - "
+            "document does not match its activation checksum"
+        )
     return record
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle: propose (validated draft) -> activate (audited) -> retire;
+# rollback re-activates the previously active version. Direct DB edits of an
+# active document fail the checksum above.
+# ---------------------------------------------------------------------------
+_VALID_EFFECTS = {"allow", "deny", "require_approval"}
+
+# Synthetic inputs exercised against every proposed document so a broken rule
+# (bad condition shape, evaluator crash) is caught before activation.
+_SIMULATION_INPUTS = [
+    {
+        "subject": "sim", "session": {"mfa": mfa, "risk_score": risk},
+        "action": {"name": "sim", "cloud_action": "x:Y", "read_only": ro, "risk": "low"},
+        "resource": {"name": "sim", "environment": env, "classification": cls},
+        "access_path_exists": path, "justification": just, "approval_present": ap,
+    }
+    for mfa in (True, False)
+    for risk in (0, 99)
+    for ro in (True, False)
+    for env in ("production", None)
+    for cls in ("sensitive", "internal")
+    for path in (True, False)
+    for just in ({}, {"case_id": "SIM-1"})
+    for ap in (True, False)
+]
+
+
+def validate_document(document: dict) -> list[str]:
+    errors = []
+    if not isinstance(document.get("version"), str) or not document.get("version"):
+        errors.append("document.version must be a non-empty string")
+    rules = document.get("rules")
+    if not isinstance(rules, list) or not rules:
+        errors.append("document.rules must be a non-empty list")
+        return errors
+    seen_ids = set()
+    for i, rule in enumerate(rules):
+        where = f"rules[{i}]"
+        rule_id = rule.get("id")
+        if not rule_id:
+            errors.append(f"{where}.id missing")
+        elif rule_id in seen_ids:
+            errors.append(f"{where}.id {rule_id!r} duplicated")
+        seen_ids.add(rule_id)
+        if rule.get("effect") not in _VALID_EFFECTS:
+            errors.append(f"{where}.effect {rule.get('effect')!r} not in {sorted(_VALID_EFFECTS)}")
+        when = rule.get("when")
+        if not isinstance(when, dict) or not when:
+            errors.append(f"{where}.when must be a non-empty object")
+        else:
+            unknown = set(when) - set(_CONDITIONS)
+            if unknown:
+                errors.append(f"{where}.when has unknown condition keys: {sorted(unknown)}")
+        for j, ob in enumerate(rule.get("obligations", [])):
+            if not isinstance(ob, dict) or "type" not in ob:
+                errors.append(f"{where}.obligations[{j}] must be an object with a 'type'")
+    return errors
+
+
+def propose_policy(db: Session, document: dict, *, actor: str) -> PolicyRecord:
+    """Validate structure, smoke-simulate, store as a draft version."""
+    errors = validate_document(document)
+    if errors:
+        raise PolicyError("; ".join(errors))
+    if db.scalar(select(PolicyRecord).where(PolicyRecord.version == document["version"])):
+        raise PolicyError(f"version {document['version']!r} already exists")
+    for sim_input in _SIMULATION_INPUTS:  # any evaluator crash fails the proposal
+        for rule in document["rules"]:
+            _rule_matches(rule, sim_input)
+    record = PolicyRecord(
+        version=document["version"],
+        document=document,
+        status="draft",
+        checksum=checksum(document),
+        created_by=actor,
+    )
+    db.add(record)
+    db.flush()
+    return record
+
+
+def activate_policy(db: Session, version: str, *, actor: str) -> PolicyRecord:
+    from . import audit  # local import: audit depends on nothing here
+    from .models import utcnow
+
+    record = db.scalar(select(PolicyRecord).where(PolicyRecord.version == version))
+    if record is None:
+        raise PolicyError(f"unknown policy version {version!r}")
+    if record.status == "active":
+        raise PolicyError(f"version {version!r} is already active")
+    if record.checksum != checksum(record.document):
+        raise PolicyError(f"version {version!r} failed integrity check; refusing to activate")
+
+    previous = db.scalar(select(PolicyRecord).where(PolicyRecord.status == "active"))
+    if previous is not None:
+        previous.status = "retired"
+    record.status = "active"
+    record.activated_at = utcnow()
+    audit.append(
+        db,
+        correlation_id=record.id,
+        subject=actor,
+        session_id="-",
+        event="policy_change",
+        action="policy:activate",
+        target=version,
+        policy_version=version,
+        context_summary={
+            "previous_version": previous.version if previous else None,
+            "checksum": record.checksum,
+        },
+        result="activated",
+    )
+    db.flush()
+    return record
+
+
+def rollback_policy(db: Session, *, actor: str) -> PolicyRecord:
+    """Re-activate the most recently retired version."""
+    candidate = db.scalar(
+        select(PolicyRecord)
+        .where(PolicyRecord.status == "retired")
+        .order_by(PolicyRecord.activated_at.desc())
+    )
+    if candidate is None:
+        raise PolicyError("no retired policy version to roll back to")
+    return activate_policy(db, candidate.version, actor=actor)
 
 
 def _rule_matches(rule: dict, policy_input: dict) -> bool:

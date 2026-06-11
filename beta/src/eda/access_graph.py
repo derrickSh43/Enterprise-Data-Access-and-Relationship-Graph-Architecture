@@ -72,18 +72,28 @@ def add_edge(
     return edge
 
 
-def resolve_path(db: Session, subject: str, action: str, resource: str) -> AccessPath | None:
+def resolve_path(
+    db: Session, subject: str, action: str, resource: str, *, tenant: str | None = None
+) -> AccessPath | None:
     """BFS from user:`subject` to asset:`resource`, collecting allowed actions
-    from role_allows edges along the way. Returns proof or None."""
+    from role_allows edges along the way. Returns proof or None.
+
+    When `tenant` is given, only nodes belonging to that tenant (or to no
+    tenant) are traversable - paths never cross tenant boundaries."""
     start = get_node(db, "user", subject)
     target = get_node(db, "asset", resource)
     if start is None or target is None:
         return None
 
-    nodes = {n.id: n for n in db.scalars(select(AccessNode)).all()}
+    def in_tenant(node: AccessNode) -> bool:
+        return tenant is None or node.tenant_id is None or node.tenant_id == tenant
+
+    nodes = {n.id: n for n in db.scalars(select(AccessNode)).all() if in_tenant(n)}
+    if start.id not in nodes or target.id not in nodes:
+        return None
     out_edges: dict[str, list[AccessEdge]] = {}
     for e in db.scalars(select(AccessEdge)).all():
-        if e.relation in TRAVERSABLE:
+        if e.relation in TRAVERSABLE and e.src_id in nodes and e.dst_id in nodes:
             out_edges.setdefault(e.src_id, []).append(e)
 
     # Breadth-first enumeration of simple paths (cycle check is per-path, not
@@ -118,3 +128,13 @@ def resolve_path(db: Session, subject: str, action: str, resource: str) -> Acces
             if e.dst_id not in on_path:
                 queue.append((e.dst_id, trail + [e]))
     return None
+
+
+def capability_path(
+    db: Session, subject: str, capability: str, resource: str, *, tenant: str | None = None
+) -> AccessPath | None:
+    """Prove that `subject` holds a capability (e.g. "approval:rotate_secret"
+    or "admin:audit:read") scoped to `resource`. Capabilities are modeled in
+    the same graph as cloud actions but in distinct namespaces, so approval
+    or admin authority never doubles as execution authority."""
+    return resolve_path(db, subject, capability, resource, tenant=tenant)

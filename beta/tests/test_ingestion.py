@@ -155,6 +155,28 @@ def test_ingestion_endpoint_over_http(client):
     assert cross.status_code == 422
 
 
+def test_idempotency_key_prevents_duplicate_application(client):
+    from eda.db import SessionLocal
+
+    with SessionLocal() as db:
+        make_source(db)
+        db.commit()
+
+    headers = {"Authorization": f"Bearer {SECRET}", "Idempotency-Key": "batch-001"}
+    first = client.post(
+        "/relationship-sources/okta-directory-prod/relationships",
+        json={"relationships": FULL_PATH}, headers=headers,
+    ).json()
+    assert first["edges_created"] == 5
+
+    replay = client.post(
+        "/relationship-sources/okta-directory-prod/relationships",
+        json={"relationships": FULL_PATH}, headers=headers,
+    ).json()
+    assert replay["idempotent_replay"] is True
+    assert replay["edges_created"] == 5  # original summary, nothing reapplied
+
+
 def test_okta_adapter_emits_ingestible_batch(db):
     from eda.adapters import okta
 

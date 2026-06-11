@@ -47,6 +47,31 @@ class Settings:
     )
     oidc_mfa_acr: str = field(default_factory=lambda: os.environ.get("EDA_OIDC_MFA_ACR", ""))
 
+    # --- Approvals ---------------------------------------------------------
+    approval_ttl_seconds: int = field(
+        default_factory=lambda: int(os.environ.get("EDA_APPROVAL_TTL", "3600"))
+    )
+
+    # --- Controlled runner ---------------------------------------------------
+    runner_timeout_seconds: int = field(
+        default_factory=lambda: int(os.environ.get("EDA_RUNNER_TIMEOUT", "30"))
+    )
+    runner_max_output_bytes: int = field(
+        default_factory=lambda: int(os.environ.get("EDA_RUNNER_MAX_OUTPUT", str(256 * 1024)))
+    )
+
+    # --- Audit anchoring -------------------------------------------------------
+    # Append-only file in an (ideally separate) trust domain receiving signed
+    # chain heads. Production: object-lock storage / transparency log.
+    audit_anchor_path: str = field(
+        default_factory=lambda: os.environ.get("EDA_AUDIT_ANCHOR_PATH", "./audit_anchors.jsonl")
+    )
+    # Hex-encoded 32-byte Ed25519 seed. Empty = generated per process (anchors
+    # then verify only within that process lifetime; configure for real use).
+    audit_anchor_key: str = field(
+        default_factory=lambda: os.environ.get("EDA_AUDIT_ANCHOR_KEY", "")
+    )
+
     # --- Relationship ingestion ------------------------------------------
     ingest_max_batch: int = field(
         default_factory=lambda: int(os.environ.get("EDA_INGEST_MAX_BATCH", "1000"))

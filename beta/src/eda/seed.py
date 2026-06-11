@@ -36,7 +36,7 @@ def seed(db: Session) -> None:
     derrick = dev_user("derrick", {"title": "security engineer"})
     marcus = dev_user("marcus", {"title": "security engineer"})
     dev_user("eve", {"title": "contractor"})  # intentionally no edges
-    dev_user("security-lead", {"title": "approver"})  # approves, holds no paths
+    lead = dev_user("security-lead", {"title": "approver"})
 
     group = ag.add_node(db, "group", "security-engineers")
     ps_ro = ag.add_node(db, "permission_set", "prod-readonly")
@@ -70,28 +70,46 @@ def seed(db: Session) -> None:
     ag.add_edge(db, account, "account_contains", ec2)
     ag.add_edge(db, account, "account_contains", secret)
 
+    # Approval and admin authority: separate capability namespaces, never
+    # doubling as execution authority. security-lead can approve and
+    # administer but holds no path conferring cloud actions; production
+    # equivalents of these edges arrive through the relationship feed.
+    leads = ag.add_node(db, "group", "security-leads")
+    ps_approver = ag.add_node(db, "permission_set", "approver-baseline")
+    role_approval = ag.add_node(db, "role", "approval-manager")
+    control_plane = ag.add_node(db, "asset", "control-plane")
+    ag.add_edge(db, lead, "member_of", leads)
+    ag.add_edge(db, leads, "assigned", ps_approver)
+    ag.add_edge(db, ps_approver, "can_assume", role_approval)
+    ag.add_edge(db, role_approval, "role_allows", account, {"actions": ["approval:*", "admin:*"]})
+    ag.add_edge(db, account, "account_contains", control_plane)
+
     # ---- Object / Ontology Graph ------------------------------------------
-    app = og.add_object(db, "application", "payments-api", {"tier": "critical"})
-    instance = og.add_object(
-        db, "ec2_instance", "ec2-prod-1",
-        {"environment": "production", "classification": "internal", "region": "us-east-1"},
+    def obj(kind, name, attrs=None):
+        return og.add_object(db, kind, name, attrs, tenant_id="local")
+
+    app = obj("application", "payments-api", {"tier": "critical"})
+    instance = obj(
+        "ec2_instance", "ec2-prod-1",
+        {"environment": "production", "classification": "internal", "region": "us-east-1",
+         "restricted_fields": ["region"]},
     )
-    vpc = og.add_object(db, "vpc", "vpc-prod", {"environment": "production"})
-    creds = og.add_object(
-        db, "secret", "db-creds-prod",
+    vpc = obj("vpc", "vpc-prod", {"environment": "production"})
+    creds = obj(
+        "secret", "db-creds-prod",
         {"environment": "production", "classification": "sensitive"},
     )
-    database = og.add_object(
-        db, "database", "payments-db",
+    database = obj(
+        "database", "payments-db",
         {"environment": "production", "classification": "sensitive"},
     )
-    chd = og.add_object(db, "data", "cardholder-data", {"classification": "sensitive"})
-    finding = og.add_object(
-        db, "finding", "F-2026-0142",
+    chd = obj("data", "cardholder-data", {"classification": "sensitive"})
+    finding = obj(
+        "finding", "F-2026-0142",
         {"severity": "high", "title": "Suspicious outbound traffic"},
     )
-    incident = og.add_object(db, "incident", "INC-42", {"status": "investigating"})
-    team = og.add_object(db, "team", "platform-security")
+    incident = obj("incident", "INC-42", {"status": "investigating"})
+    team = obj("team", "platform-security")
 
     og.relate(db, app, "runs_on", instance)
     og.relate(db, instance, "in_vpc", vpc)

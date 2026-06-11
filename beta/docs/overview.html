@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>EDA Control Plane — How It Works</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; overflow: hidden; }
+  body {
+    font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+    background: linear-gradient(160deg, #f4f8ff 0%, #eef4fb 55%, #f6f1ff 100%);
+    color: #1d2733;
+    display: flex;
+    flex-direction: column;
+    padding: 1.6vh 1.4vw;
+    gap: 1.4vh;
+  }
+
+  /* ---------- header ---------- */
+  header { text-align: center; }
+  header h1 {
+    font-size: clamp(20px, 3.2vh, 34px);
+    font-weight: 700;
+    letter-spacing: -0.5px;
+  }
+  header h1 .accent { color: #2563eb; }
+  header p {
+    font-size: clamp(12px, 1.9vh, 18px);
+    color: #51606f;
+    margin-top: 0.4vh;
+  }
+  header p b { color: #1d2733; }
+
+  /* ---------- pipeline ---------- */
+  .pipeline {
+    flex: 1.25;
+    display: flex;
+    align-items: stretch;
+    gap: 0.45vw;
+  }
+  .stage {
+    flex: 1;
+    background: #ffffff;
+    border-radius: 14px;
+    border-top: 6px solid var(--c);
+    box-shadow: 0 6px 18px rgba(29, 39, 51, 0.08);
+    padding: 1.6vh 0.9vw;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    gap: 1.1vh;
+  }
+  .stage .icon {
+    width: 8.5vh; height: 8.5vh;
+    border-radius: 50%;
+    background: color-mix(in srgb, var(--c) 14%, white);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 4.4vh;
+  }
+  .stage .num {
+    font-size: clamp(9px, 1.5vh, 15px);
+    font-weight: 700;
+    color: var(--c);
+    letter-spacing: 1.5px;
+    text-transform: uppercase;
+  }
+  .stage h2 { font-size: clamp(13px, 2.5vh, 25px); font-weight: 700; }
+  .stage .q {
+    font-size: clamp(11px, 1.95vh, 19px);
+    font-weight: 600;
+    color: var(--c);
+    font-style: italic;
+  }
+  .stage .d {
+    font-size: clamp(10px, 1.8vh, 17px);
+    color: #5b6a79;
+    line-height: 1.4;
+  }
+  .arrow {
+    align-self: center;
+    font-size: 2.6vh;
+    color: #9db1c7;
+    font-weight: 700;
+    flex: 0 0 auto;
+  }
+
+  /* ---------- feedback loop ---------- */
+  .loop {
+    display: flex;
+    align-items: center;
+    gap: 1vw;
+    background: #ffffff;
+    border: 2px dashed #c084fc;
+    border-radius: 14px;
+    padding: 1.2vh 1.4vw;
+  }
+  .loop .icon { font-size: 3.6vh; }
+  .loop .title { font-weight: 700; color: #7c3aed; font-size: clamp(12px, 2.1vh, 20px); white-space: nowrap; }
+  .loop .desc { font-size: clamp(11px, 1.9vh, 18px); color: #51606f; }
+  .loop .desc b { color: #1d2733; }
+  .loop .back { margin-left: auto; font-size: clamp(11px, 1.8vh, 17px); color: #7c3aed; font-weight: 600; white-space: nowrap; }
+
+  /* ---------- outcomes ---------- */
+  .outcomes {
+    display: flex;
+    gap: 0.9vw;
+  }
+  .chip {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    gap: 0.7vw;
+    border-radius: 12px;
+    padding: 1.3vh 1.1vw;
+    font-size: clamp(11px, 1.85vh, 18px);
+    line-height: 1.3;
+    background: #ffffff;
+    box-shadow: 0 4px 12px rgba(29, 39, 51, 0.06);
+  }
+  .chip .mark { font-size: 2.4vh; }
+  .chip.deny { border-left: 6px solid #ef4444; }
+  .chip.allow { border-left: 6px solid #22c55e; background: #f2fcf5; }
+  .chip b { display: block; }
+
+  /* ---------- principles ---------- */
+  .principles { display: flex; gap: 0.9vw; }
+  .principle {
+    flex: 1;
+    background: #1f3a5f;
+    color: #eaf2fc;
+    border-radius: 12px;
+    padding: 1.4vh 1.1vw;
+    text-align: center;
+  }
+  .principle .p-icon { font-size: 3vh; }
+  .principle b { display: block; font-size: clamp(11px, 2vh, 19px); margin: 0.4vh 0 0.2vh; }
+  .principle span { font-size: clamp(10px, 1.7vh, 16px); color: #b9cce4; }
+</style>
+</head>
+<body>
+
+  <header>
+    <h1>Enterprise Data Access &amp; Relationship Graph — <span class="accent">a control plane that asks "who's allowed?" before "what's connected?"</span></h1>
+    <p>Your company's map of systems, access, and data <b>stays inside your own walls</b> — and every action must earn its way through these gates:</p>
+  </header>
+
+  <div class="pipeline">
+    <div class="stage" style="--c:#2563eb;">
+      <div class="icon">🪪</div>
+      <div class="num">Step 1 · Identity</div>
+      <h2>Prove who you are</h2>
+      <div class="q">"Who is asking?"</div>
+      <div class="d">Your real company login (Okta, Microsoft). Nobody gets to claim an identity — or skip MFA.</div>
+    </div>
+    <div class="arrow">→</div>
+
+    <div class="stage" style="--c:#0d9488;">
+      <div class="icon">🗺️</div>
+      <div class="num">Step 2 · Access Graph</div>
+      <h2>Prove a path exists</h2>
+      <div class="q">"Are you actually allowed to reach this?"</div>
+      <div class="d">A live map of who can reach what — through groups, roles, and permissions. No path, no access.</div>
+    </div>
+    <div class="arrow">→</div>
+
+    <div class="stage" style="--c:#d97706;">
+      <div class="icon">⚖️</div>
+      <div class="num">Step 3 · Policy</div>
+      <h2>Check the rules</h2>
+      <div class="q">"Should that access be honored right now?"</div>
+      <div class="d">Clear, versioned rules: MFA? Risky session? Production? Need a ticket? Need a human approval?</div>
+    </div>
+    <div class="arrow">→</div>
+
+    <div class="stage" style="--c:#7c3aed;">
+      <div class="icon">🔑</div>
+      <div class="num">Step 4 · Broker</div>
+      <h2>Issue a temporary key</h2>
+      <div class="q">"Access for minutes, not forever."</div>
+      <div class="d">A short-lived key scoped to exactly this one task. It expires on its own — no standing privilege.</div>
+    </div>
+    <div class="arrow">→</div>
+
+    <div class="stage" style="--c:#db2777;">
+      <div class="icon">🧩</div>
+      <div class="num">Step 5 · Context</div>
+      <h2>See only your slice</h2>
+      <div class="q">"What is this thing connected to?"</div>
+      <div class="d">The object map answers — but only the approved neighborhood. Sensitive items stay hidden.</div>
+    </div>
+    <div class="arrow">→</div>
+
+    <div class="stage" style="--c:#ea580c;">
+      <div class="icon">🛠️</div>
+      <div class="num">Step 6 · Action</div>
+      <h2>Do the governed thing</h2>
+      <div class="q">"Approved verbs only."</div>
+      <div class="d">A fixed menu of safe actions. Risky ones run in a sealed box that never hands out the keys.</div>
+    </div>
+    <div class="arrow">→</div>
+
+    <div class="stage" style="--c:#475569;">
+      <div class="icon">📜</div>
+      <div class="num">Step 7 · Audit</div>
+      <h2>Record everything</h2>
+      <div class="q">"Who, what, why, under which rule?"</div>
+      <div class="d">A tamper-evident log of every decision — each entry sealed to the one before it.</div>
+    </div>
+  </div>
+
+  <div class="loop">
+    <div class="icon">🤖</div>
+    <div class="title">Local AI Feedback Loop</div>
+    <div class="desc">A private AI (running on <b>your</b> infrastructure) studies the audit trail and <b>suggests</b> improvements — simpler approvals, unused access to remove, better rules. <b>Humans approve every change. The AI never enforces anything.</b></div>
+    <div class="back">⟲ learns from Step 7, proposes to Step 3</div>
+  </div>
+
+  <div class="outcomes">
+    <div class="chip deny"><span class="mark">⛔</span><span><b>Contractor with no access path</b>Denied — no proven route to the resource.</span></div>
+    <div class="chip deny"><span class="mark">⛔</span><span><b>Engineer who skipped MFA</b>Denied — policy refuses the session.</span></div>
+    <div class="chip deny"><span class="mark">⛔</span><span><b>Risky change, no human sign-off</b>Paused — a qualified approver must agree first.</span></div>
+    <div class="chip allow"><span class="mark">✅</span><span><b>Right person, right reason, approved</b>15-minute scoped key, action runs, fully logged.</span></div>
+  </div>
+
+  <div class="principles">
+    <div class="principle"><div class="p-icon">🏠</div><b>Local-first</b><span>Your operational map never lives in someone else's cloud</span></div>
+    <div class="principle"><div class="p-icon">🚪</div><b>Authority before context</b><span>Prove permission before anything is revealed</span></div>
+    <div class="principle"><div class="p-icon">⏳</div><b>Temporary access</b><span>Minutes-long keys instead of permanent privilege</span></div>
+    <div class="principle"><div class="p-icon">🧾</div><b>Explainable always</b><span>Every yes and every no can be reconstructed</span></div>
+  </div>
+
+</body>
+</html>

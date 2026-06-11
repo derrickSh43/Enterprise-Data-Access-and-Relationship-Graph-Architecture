@@ -14,15 +14,18 @@ import json
 import os
 import pathlib
 
-DB_FILE = pathlib.Path(__file__).parent / "demo.db"
-if DB_FILE.exists():
-    DB_FILE.unlink()
-os.environ["EDA_DATABASE_URL"] = f"sqlite:///{DB_FILE}"
-os.environ["EDA_AUTH_MODE"] = "dev"
 
-from fastapi.testclient import TestClient  # noqa: E402
-
-from eda.api import app  # noqa: E402
+def _setup_environment() -> None:
+    """Runs only in the real main process (never in controlled-runner
+    children, which re-import this file as __mp_main__ on Windows spawn)."""
+    db_file = pathlib.Path(__file__).parent / "demo.db"
+    anchor_file = pathlib.Path(__file__).parent / "demo_anchors.jsonl"
+    for stale in (db_file, anchor_file):
+        if stale.exists():
+            stale.unlink()
+    os.environ["EDA_DATABASE_URL"] = f"sqlite:///{db_file}"
+    os.environ["EDA_AUTH_MODE"] = "dev"
+    os.environ["EDA_AUDIT_ANCHOR_PATH"] = str(anchor_file)
 
 
 def banner(title: str) -> None:
@@ -39,6 +42,11 @@ def auth(token: str) -> dict:
 
 
 def main() -> None:
+    _setup_environment()
+    from fastapi.testclient import TestClient
+
+    from eda.api import app
+
     with TestClient(app) as client:
         def session_for(subject, mfa=True, risk=0):
             return client.post(
@@ -154,17 +162,23 @@ def main() -> None:
         print(f"forged collector credential -> HTTP {forged.status_code}")
 
         # ------------------------------------------------------------------
-        banner("6. Audit / Evidence Layer: hash-chained, fully reconstructable")
-        print(json.dumps(client.get("/audit/verify").json(), indent=2))
-        records = client.get("/audit/records").json()
-        print(f"\n{len(records)} audit records; latest first:")
+        banner("6. Audit / Evidence Layer: hash-chained, capability-gated, anchored")
+        derrick_view = client.get("/audit/records", headers=auth(derrick))
+        print(f"derrick requests the audit log -> HTTP {derrick_view.status_code} "
+              "(authenticated, but no admin:audit:read capability path)")
+        print(json.dumps(client.get("/audit/verify", headers=auth(lead)).json(), indent=2))
+        records = client.get("/audit/records", headers=auth(lead)).json()
+        print(f"\n{len(records)} audit records visible to tenant 'local'; latest first:")
         for r in records[:9]:
             print(f"  seq={r['seq']:<3} {r['result']:<18} {r['subject']:<26} "
                   f"{r['action'] or '-':<22} hash={r['hash'][:12]}...")
+        anchor = client.post("/audit/anchors", headers=auth(lead)).json()
+        print(f"\nchain head seq={anchor['seq']} signed and anchored externally; "
+              f"anchor verification: {client.get('/audit/anchors/verify', headers=auth(lead)).json()['ok']}")
 
         # ------------------------------------------------------------------
         banner("7. Local AI Feedback Loop: observes, proposes - humans decide")
-        proposals = client.post("/feedback/run").json()
+        proposals = client.post("/feedback/run", headers=auth(lead)).json()
         if not proposals:
             print("no patterns crossed thresholds yet")
         for p in proposals:
@@ -175,7 +189,7 @@ def main() -> None:
             ).json()
             print(f"  -> human decision: {decision['status']} by {decision['decided_by']}")
 
-        print(json.dumps(client.get("/audit/verify").json(), indent=2))
+        print(json.dumps(client.get("/audit/verify", headers=auth(lead)).json(), indent=2))
         print("\nDone. Inspect the API interactively: uvicorn eda.api:app --reload "
               "then open http://127.0.0.1:8000/docs")
 

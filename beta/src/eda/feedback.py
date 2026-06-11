@@ -12,6 +12,7 @@ implementation is template-based and fully offline.
 """
 
 from collections import Counter
+from fnmatch import fnmatch
 from typing import Protocol
 
 from sqlalchemy import select
@@ -19,6 +20,12 @@ from sqlalchemy.orm import Session
 
 from . import audit
 from .models import AuditRecord, Recommendation, utcnow
+
+
+def _norm(identifier: str) -> str:
+    """Canonical form for authority identifiers so naming differences
+    (case, whitespace) never create false least-privilege findings."""
+    return identifier.strip().lower()
 
 
 class NarrativeGateway(Protocol):
@@ -44,9 +51,9 @@ def run_analyzers(db: Session, narrative: NarrativeGateway | None = None) -> lis
 
     # 1. Repeated denials: same subject+action denied 3+ times -> review policy or training.
     denial_counts = Counter(
-        (r.subject, r.action) for r in records if r.result == "denied" and r.action
+        (r.subject, r.action, r.tenant_id) for r in records if r.result == "denied" and r.action
     )
-    for (subject, action), count in denial_counts.items():
+    for (subject, action, tenant_id), count in denial_counts.items():
         if count < 3:
             continue
         fingerprint = f"denials:{subject}:{action}"
@@ -55,6 +62,7 @@ def run_analyzers(db: Session, narrative: NarrativeGateway | None = None) -> lis
         proposals.append(
             Recommendation(
                 kind="repeated_denials",
+                tenant_id=tenant_id,
                 summary=narrative.summarize(
                     {
                         "template": (
@@ -73,8 +81,10 @@ def run_analyzers(db: Session, narrative: NarrativeGateway | None = None) -> lis
 
     # 2. Approval bottleneck: an action repeatedly requiring approval -> propose a
     #    pre-approved workflow template (humans decide; this only suggests).
-    approval_counts = Counter(r.action for r in records if r.result == "approval_required" and r.action)
-    for action, count in approval_counts.items():
+    approval_counts = Counter(
+        (r.action, r.tenant_id) for r in records if r.result == "approval_required" and r.action
+    )
+    for (action, tenant_id), count in approval_counts.items():
         if count < 3:
             continue
         fingerprint = f"approval_bottleneck:{action}"
@@ -83,6 +93,7 @@ def run_analyzers(db: Session, narrative: NarrativeGateway | None = None) -> lis
         proposals.append(
             Recommendation(
                 kind="approval_bottleneck",
+                tenant_id=tenant_id,
                 summary=narrative.summarize(
                     {
                         "template": (
@@ -98,22 +109,35 @@ def run_analyzers(db: Session, narrative: NarrativeGateway | None = None) -> lis
             )
         )
 
-    # 3. Access drift / least privilege: actions proven on access paths but never
-    #    executed successfully -> candidates for narrowing.
+    # 3. Access drift / least privilege: authority proven on access paths but
+    #    never exercised -> candidates for narrowing. Both sides are
+    #    normalized, granted wildcards are matched against observed calls, and
+    #    approval capabilities count approval decisions as exercise - so
+    #    naming differences never produce false findings.
     proven = {
-        a
+        _norm(a)
         for r in records
         if r.access_path
         for hop in r.access_path
         for a in hop.get("actions", [])
     }
     exercised = {
-        c.get("service", "") + ":" + c.get("call", "")
+        _norm(c.get("service", "") + ":" + c.get("call", ""))
         for r in records
         if r.result == "allowed" and r.api_calls
         for c in r.api_calls
     }
-    unused = sorted(a for a in proven if "*" not in a and a not in exercised)
+    exercised |= {
+        _norm(f"approval:{r.action}")
+        for r in records
+        if r.event == "approval_decision" and r.action
+    }
+    unused = sorted(
+        pattern
+        for pattern in proven
+        if not pattern.startswith("admin:")  # exercised out-of-band by admin surfaces
+        and not any(fnmatch(call, pattern) for call in exercised)
+    )
     if unused:
         fingerprint = "unused:" + ",".join(unused)
         if not _existing(db, "least_privilege", fingerprint):

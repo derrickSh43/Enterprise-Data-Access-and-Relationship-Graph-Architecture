@@ -1,13 +1,15 @@
 """Authority Broker: turns an approved decision into temporary scoped authority.
 
-Prefers short-lived, scoped, auditable access over standing privilege. Locally
-this issues mock STS-shaped credentials; the `AwsStsBroker` adapter shows where
-real `sts:AssumeRole` with a session policy plugs in (GCP impersonation and
-Azure PIM adapters follow the same interface).
-
-Credentials are stored on the Grant for the executor; audit records only ever
-see `redacted()`. For actions with the `controlled_runner` obligation the
-credentials never leave the action layer at all.
+Credential handling:
+- Usable credential material is never persisted in the control-plane database.
+  It lives in the broker's `CredentialVault`; the Grant row carries only an
+  opaque `credential_ref` plus redacted metadata. (The reference vault is
+  in-memory; production swaps in HashiCorp Vault / KMS-wrapped storage behind
+  the same three methods.)
+- Provider credential lifetime never exceeds the grant lifetime the control
+  plane enforces: brokers report the provider expiry and `issue_grant` rejects
+  any credential that would outlive its grant. Revoking a grant deletes the
+  vault entry, so expiration/revocation stay consistent across both systems.
 """
 
 import secrets
@@ -24,34 +26,68 @@ class GrantError(Exception):
     pass
 
 
+class CredentialVault:
+    """Opaque-reference credential store. DB never sees the values."""
+
+    def __init__(self):
+        self._store: dict[str, tuple[dict, datetime]] = {}
+
+    def put(self, credentials: dict, expires_at: datetime) -> str:
+        ref = "vault-" + secrets.token_urlsafe(24)
+        self._store[ref] = (credentials, expires_at)
+        return ref
+
+    def get(self, ref: str) -> dict:
+        entry = self._store.get(ref)
+        if entry is None:
+            raise GrantError("credentials not in vault (expired, revoked, or never issued)")
+        credentials, expires_at = entry
+        if datetime.now(timezone.utc) > expires_at:
+            del self._store[ref]
+            raise GrantError("vaulted credentials expired")
+        return credentials
+
+    def revoke(self, ref: str) -> None:
+        self._store.pop(ref, None)
+
+
+vault = CredentialVault()
+
+
 class BaseBroker(ABC):
     kind: str
 
     @abstractmethod
-    def issue_credentials(self, *, subject: str, scope: dict, ttl_seconds: int, tags: dict) -> dict:
-        ...
+    def issue_credentials(
+        self, *, subject: str, scope: dict, ttl_seconds: int, tags: dict
+    ) -> tuple[dict, datetime]:
+        """Return (credentials, provider_expires_at)."""
 
 
 class MockStsBroker(BaseBroker):
-    """Local stand-in for AWS STS. Shapes match AssumeRole output."""
+    """Local stand-in for AWS STS. Shapes match AssumeRole output; the
+    provider expiry exactly matches the requested TTL."""
 
     kind = "mock_sts"
 
-    def issue_credentials(self, *, subject: str, scope: dict, ttl_seconds: int, tags: dict) -> dict:
-        return {
+    def issue_credentials(self, *, subject: str, scope: dict, ttl_seconds: int, tags: dict):
+        credentials = {
             "AccessKeyId": "MOCKASIA" + secrets.token_hex(6).upper(),
             "SecretAccessKey": secrets.token_urlsafe(30),
             "SessionToken": secrets.token_urlsafe(48),
             "SessionPolicy": {"actions": scope["actions"], "resources": scope["resources"]},
             "SessionTags": tags,
         }
+        return credentials, datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)
 
 
 class AwsStsBroker(BaseBroker):
     """Real AWS adapter: scoped AssumeRole with an inline session policy.
 
-    Requires `pip install .[aws]` plus a configured role ARN; included to show
-    the integration seam, not exercised by the local demo or tests.
+    AWS enforces a 900s minimum session duration. Grants shorter than that
+    are refused outright - the control plane never lets a provider credential
+    outlive its grant. (Short-TTL high-risk work still flows through the
+    controlled runner, where credentials are confined to the job process.)
     """
 
     kind = "aws_sts"
@@ -59,7 +95,12 @@ class AwsStsBroker(BaseBroker):
     def __init__(self, role_arn: str):
         self.role_arn = role_arn
 
-    def issue_credentials(self, *, subject: str, scope: dict, ttl_seconds: int, tags: dict) -> dict:
+    def issue_credentials(self, *, subject: str, scope: dict, ttl_seconds: int, tags: dict):
+        if ttl_seconds < 900:
+            raise GrantError(
+                "AWS STS minimum session duration is 900s, which would outlive a "
+                f"{ttl_seconds}s grant; raise the grant TTL"
+            )
         try:
             import boto3
         except ImportError as exc:
@@ -75,11 +116,12 @@ class AwsStsBroker(BaseBroker):
         response = boto3.client("sts").assume_role(
             RoleArn=self.role_arn,
             RoleSessionName=f"eda-{subject}"[:64],
-            DurationSeconds=max(900, ttl_seconds),
+            DurationSeconds=ttl_seconds,
             Policy=json.dumps(session_policy),
             Tags=[{"Key": k, "Value": str(v)} for k, v in tags.items()],
         )
-        return response["Credentials"]
+        credentials = response["Credentials"]
+        return credentials, credentials["Expiration"]
 
 
 _default_broker: BaseBroker = MockStsBroker()
@@ -94,6 +136,7 @@ def issue_grant(
     obligations: list[dict],
     session_tags: dict,
     correlation_id: str,
+    tenant_id: str | None = None,
     broker: BaseBroker | None = None,
 ) -> Grant:
     broker = broker or _default_broker
@@ -106,17 +149,29 @@ def issue_grant(
             read_only = True
 
     scope = {"actions": [action], "resources": [resource], "read_only": read_only}
-    credentials = broker.issue_credentials(
+    credentials, provider_expires_at = broker.issue_credentials(
         subject=subject, scope=scope, ttl_seconds=ttl, tags=session_tags
     )
+    grant_expires_at = utcnow() + timedelta(seconds=ttl)
+    if provider_expires_at.tzinfo is None:
+        provider_expires_at = provider_expires_at.replace(tzinfo=timezone.utc)
+    # Invariant: provider credential dies no later than the grant (1s slack
+    # for clock arithmetic between "now" reads).
+    if provider_expires_at > grant_expires_at + timedelta(seconds=1):
+        raise GrantError(
+            f"broker returned a credential outliving the grant "
+            f"({provider_expires_at.isoformat()} > {grant_expires_at.isoformat()})"
+        )
+
     grant = Grant(
         subject=subject,
         scope=scope,
         session_tags=session_tags,
         broker_kind=broker.kind,
-        credentials=credentials,
-        expires_at=utcnow() + timedelta(seconds=ttl),
+        credential_ref=vault.put(credentials, provider_expires_at),
+        expires_at=grant_expires_at,
         correlation_id=correlation_id,
+        tenant_id=tenant_id,
     )
     db.add(grant)
     db.flush()
@@ -138,8 +193,22 @@ def validate_grant(grant: Grant, *, action: str, resource: str) -> None:
         raise GrantError(f"resource {resource!r} outside grant scope")
 
 
+def fetch_credentials(grant: Grant) -> dict:
+    """Release vaulted credentials for execution. Callers are the action
+    executor and controlled runner only - never API responses or audit."""
+    if grant.revoked:
+        raise GrantError("grant revoked")
+    return vault.get(grant.credential_ref)
+
+
+def revoke_grant(grant: Grant) -> None:
+    """Revoke in both systems at once: control-plane flag + vault deletion."""
+    grant.revoked = True
+    vault.revoke(grant.credential_ref)
+
+
 def redacted(grant: Grant) -> dict:
-    """Audit-safe view: everything except credential material."""
+    """Audit-safe view: opaque reference and metadata only."""
     return {
         "grant_id": grant.id,
         "subject": grant.subject,
@@ -148,5 +217,7 @@ def redacted(grant: Grant) -> dict:
         "broker_kind": grant.broker_kind,
         "issued_at": grant.issued_at.isoformat(),
         "expires_at": grant.expires_at.isoformat(),
-        "credentials": "REDACTED",
+        "tenant_id": grant.tenant_id,
+        "credentials": "VAULTED",
+        "credential_ref": grant.credential_ref[:14] + "...",
     }

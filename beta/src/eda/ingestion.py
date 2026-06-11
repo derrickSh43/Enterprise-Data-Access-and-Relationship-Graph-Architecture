@@ -22,7 +22,7 @@ from sqlalchemy.orm import Session
 from . import audit
 from .access_graph import TRAVERSABLE
 from .config import settings
-from .models import AccessEdge, AccessNode, RelationshipSource
+from .models import AccessEdge, AccessNode, IngestReceipt, RelationshipSource
 
 ALLOWED_KINDS = {"user", "group", "role", "permission_set", "service_account", "account", "asset"}
 ALLOWED_RELATIONS = set(TRAVERSABLE)
@@ -225,6 +225,21 @@ def ingest(
         target=source.id,
         result="accepted",
         context_summary=summary,
+        tenant_id=source.tenant_id,
     )
     db.flush()
     return summary
+
+
+def find_receipt(db: Session, source_id: str, idempotency_key: str) -> IngestReceipt | None:
+    return db.scalar(
+        select(IngestReceipt).where(
+            IngestReceipt.source_id == source_id,
+            IngestReceipt.idempotency_key == idempotency_key,
+        )
+    )
+
+
+def store_receipt(db: Session, source_id: str, idempotency_key: str, summary: dict) -> None:
+    db.add(IngestReceipt(source_id=source_id, idempotency_key=idempotency_key, summary=summary))
+    db.flush()

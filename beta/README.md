@@ -45,7 +45,9 @@ $env:EDA_DATABASE_URL = "postgresql+psycopg2://eda:eda-dev-only@localhost:5432/e
 | 5. Action/Workflow Layer | [actions.py](src/eda/actions.py)             | `GET /actions`                |
 | 6. Audit/Evidence Layer  | [audit.py](src/eda/audit.py)                 | `GET /audit/records`, `GET /audit/verify` |
 | 7. Local AI Feedback     | [feedback.py](src/eda/feedback.py)           | `POST /feedback/run`, `/feedback/recommendations` |
+| Controlled runner        | [runner.py](src/eda/runner.py)               | (process-isolated execution for writes/high-risk actions) |
 | Request flow             | [gateway.py](src/eda/gateway.py)             | `POST /requests`, `POST /approvals/{id}/decision` |
+| Operations               | [docs/OPERATIONS.md](docs/OPERATIONS.md)     | `/healthz`, `/readyz`, `/metrics` |
 
 ## How the design principles show up in code
 
@@ -66,6 +68,22 @@ Identity and access relationships come from trusted enterprise inputs, not from 
 - **Collector ingestion** — registered sources (e.g. `okta-directory-prod`) push relationship batches with a source-bound credential. Each source is confined to its namespace (`okta:`), so a collector can never write another tenant's or source's relationships. Batches are validated atomically (schema, kinds, relations, batch size) and every imported node/edge records `tenant_id`, `external_id`, `source_id`, and `observed_at` ([ingestion.py](src/eda/ingestion.py)).
 - **Unchanged downstream** — imported relationships feed the existing path resolver; policy, broker, object graph, actions, and audit are untouched. Seeded identities remain available only to the dev provider for tests and local demos.
 
+## Beta hardening
+
+The beta work plan layered fifteen hardening packages onto the front door, preserving the request flow:
+
+- **Approval authorization** ([gateway.py](src/eda/gateway.py)) — approving is its own authorization decision: the approver must hold a proven access path conferring the server-derived `approval:<action>` capability for the target resource (preserved as evidence on the approval record), capability namespaces never double as execution authority, and self-approval stays rejected.
+- **Approval replay prevention** — approvals are bound to the exact request (subject, action, resource, inputs hash), expire (`EDA_APPROVAL_TTL`), and are consumed atomically exactly once via compare-and-swap.
+- **Action/resource compatibility + typed inputs** ([actions.py](src/eda/actions.py)) — actions declare supported resource kinds and providers (inspecting a secret with an EC2 action is rejected before policy), and every action has a strict pydantic input schema: types, length bounds, unknown-field rejection.
+- **Disclosure control** ([objects.py](src/eda/objects.py)) — root authority doesn't authorize the neighborhood: sensitive neighbors are redacted at one hop and omitted beyond, `restricted_fields` are masked on every non-root node, and other tenants' objects are invisible.
+- **Admin endpoint authorization** ([api.py](src/eda/api.py)) — policy, access-graph, audit, feedback, and metrics surfaces require proven `admin:<area>:<verb>` capability paths; authentication alone gets a 403.
+- **Credential storage + lifetime consistency** ([broker.py](src/eda/broker.py)) — credentials live in the broker vault; the database holds an opaque reference. Provider credential lifetime may never exceed the grant lifetime (the AWS adapter refuses sub-900s grants), and revocation clears both systems at once.
+- **Controlled runner** ([runner.py](src/eda/runner.py)) — a real process boundary: credentials confined to the job process, wall-clock timeouts with termination, output-size caps, and only declared output keys returned (exfiltration attempts are stripped — tested).
+- **Audit hardening** ([audit.py](src/eda/audit.py)) — appends are serialized with a DB-level unique-predecessor backstop (no competing chain heads), and chain heads are Ed25519-signed and anchored to an external trust domain so even a full chain recompute by a DBA is detectable.
+- **Tenant isolation** — tenant scope on nodes, edges, objects, approvals, grants, audit records, and recommendations; access paths never cross tenants; audit and recommendation queries are filtered to the caller's tenant.
+- **Policy lifecycle** ([policy.py](src/eda/policy.py)) — propose (validated + simulated) → activate (audited) → rollback; active documents are checksummed, so a direct database edit fails closed at evaluation.
+- **Analyzer accuracy + operations** — least-privilege analysis normalizes identifiers and matches wildcards before flagging unused authority; health/readiness/metrics endpoints, collector idempotency keys, and [docs/OPERATIONS.md](docs/OPERATIONS.md) cover backup, restore, recovery, and key management.
+
 ## Seeded example environment
 
 Matches the design doc's example: `user:derrick → member_of group:security-engineers → assigned permission_set:prod-readonly → can_assume role:prod-security-auditor → role_allows ec2:Describe* → account:prod → asset:ec2-prod-1`, plus a privileged `prod-secops` path for rotation/containment, `marcus` (path but weak sessions), and `eve` (contractor, no path). The object graph models `payments-api`, its instance, VPC, secret, database, cardholder data, finding `F-2026-0142`, and incident `INC-42`. See [seed.py](src/eda/seed.py).
@@ -74,8 +92,8 @@ Matches the design doc's example: `user:derrick → member_of group:security-eng
 
 Real: path resolution, policy evaluation, grant scoping/TTL/validation, approval workflow (with self-approval rejection), context scoping with sensitive-attribute redaction, hash-chained audit with tamper detection, feedback analyzers with human gating.
 
-Real: OIDC token validation (full JWKS/issuer/audience/expiry/tenant/MFA verification — point it at a real Okta or Entra app), fail-closed identity mapping, and collector ingestion with namespace confinement and provenance.
+Real: OIDC token validation (full JWKS/issuer/audience/expiry/tenant/MFA verification — point it at a real Okta or Entra app), fail-closed identity mapping, collector ingestion with namespace confinement and provenance, capability-based approval authorization with single-use replay-proof approvals, process-isolated controlled execution, vaulted credentials with lifetime consistency, per-node disclosure control, capability-gated admin surfaces, tenant isolation, checksummed policy lifecycle, and signed audit anchoring.
 
-Mocked/stand-in (each behind a production seam): the dev identity provider (tests/local demos only), cloud credentials (`MockStsBroker` → `AwsStsBroker`/GCP impersonation/Azure PIM), action handlers (mock API calls → real SDK calls inside the controlled runner), narrative summaries (templates → local LLM gateway).
+Mocked/stand-in (each behind a production seam): the dev identity provider (tests/local demos only), cloud credentials (`MockStsBroker` → `AwsStsBroker`/GCP impersonation/Azure PIM), action handlers (mock API calls → real SDK calls inside the controlled runner), narrative summaries (templates → local LLM gateway), the in-memory credential vault (→ Vault/KMS), and the anchor file (→ object-lock storage / transparency log).
 
-Production hardening not included here: migrations (Alembic), external audit anchoring (object-lock / transparency log), approver authorization policies, rate limiting, mTLS between components, HA.
+Remaining production work (documented in [docs/OPERATIONS.md](docs/OPERATIONS.md)): Alembic migrations, OS-level runner resource limits (job objects/cgroups), Prometheus metrics export, rate limiting, mTLS between components, HA.
