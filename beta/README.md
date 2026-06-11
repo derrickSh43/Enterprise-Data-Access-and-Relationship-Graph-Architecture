@@ -1,76 +1,81 @@
-# Beta Implementation Work Plan
+# EDA Control Plane
 
-This document tracks the implementation issues to address after the secure enterprise front door is in place. The front door covers trusted identity verification, canonical identity mapping, and secure relationship ingestion. The existing authority-first architecture remains intact.
+Reference implementation of the **Enterprise Data Access and Relationship Graph Architecture** — a local-first, governed enterprise control plane. The full design document lives in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-## 1. Approval Authorization
+The core philosophy:
 
-Approval must be a separate authorization decision, not simply a decision made by any user other than the requester.
+> Model authority, evaluate policy, broker temporary access, scope context, govern actions, audit everything, and let AI recommend — not enforce.
 
-- Define server-derived capabilities using `approval:<action_name>`, such as `approval:rotate_secret`.
-- Store the required approval capability on the approval record. Clients must not provide or override it.
-- Model approver authority in the existing access graph using principals, groups, permission sets, roles, capabilities, and resource scopes.
-- Keep approval authority separate from action-execution authority.
-- Require a proven access path showing that the approver has the required approval capability for the target resource.
-- Preserve the approver access path as decision evidence.
-- Retain self-approval rejection.
-- Seed representative approval relationships for tests; production relationships should arrive through the secure relationship feed.
+## Quickstart
 
-## 2. Action and Resource Compatibility
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python -m pip install -e ".[dev]"
 
-Actions must declare the resource types and providers they support. Reject requests where the action does not apply to the target, such as inspecting a secret with an EC2 inspection action.
+# run the end-to-end demo (the doc's "Cloud Investigation Request" scenario)
+.\.venv\Scripts\python demo.py
 
-## 3. Approval Replay Prevention
+# run the test suite
+.\.venv\Scripts\python -m pytest
 
-Bind each approval to the exact request, give it an expiration time, and make it single-use. Approval consumption must be atomic so concurrent requests cannot reuse one approval.
+# run the HTTP API and explore it at http://127.0.0.1:8000/docs
+.\.venv\Scripts\uvicorn eda.api:app --reload
+```
 
-## 4. Object-Graph Disclosure Control
+Default storage is SQLite (zero infrastructure). For Postgres:
 
-Authorization of the root object must not automatically authorize every connected object. Apply visibility and redaction decisions to each returned node, relationship, and sensitive field.
+```powershell
+docker compose up -d
+$env:EDA_DATABASE_URL = "postgresql+psycopg2://eda:eda-dev-only@localhost:5432/eda"
+.\.venv\Scripts\python -m pip install -e ".[postgres]"
+.\.venv\Scripts\python -m eda.seed
+```
 
-## 5. Administrative Endpoint Authorization
+## Component map
 
-Protect policy, access-path, audit, feedback, and other administrative endpoints with explicit role or capability checks. Authentication alone is insufficient.
+| Architecture component   | Module                                       | HTTP surface                  |
+| ------------------------ | -------------------------------------------- | ----------------------------- |
+| Identity providers (OIDC + dev) | [identity_providers.py](src/eda/identity_providers.py) | bearer tokens on `/requests`, approvals, feedback; `POST /identity/sessions` (dev mode only) |
+| Relationship ingestion   | [ingestion.py](src/eda/ingestion.py)         | `POST /relationship-sources/{id}/relationships` |
+| Directory feed adapters  | [adapters/okta.py](src/eda/adapters/okta.py) | (transforms provider exports into the ingestion contract) |
+| 1. Access Graph          | [access_graph.py](src/eda/access_graph.py)   | `GET /access-graph/path`      |
+| 2. Policy Engine         | [policy.py](src/eda/policy.py)               | `GET /policy/active`, `POST /policy/evaluate` |
+| 3. Authority Broker      | [broker.py](src/eda/broker.py)               | (internal; grants visible redacted in traces) |
+| 4. Object/Ontology Graph | [objects.py](src/eda/objects.py)             | (context returned in request traces) |
+| 5. Action/Workflow Layer | [actions.py](src/eda/actions.py)             | `GET /actions`                |
+| 6. Audit/Evidence Layer  | [audit.py](src/eda/audit.py)                 | `GET /audit/records`, `GET /audit/verify` |
+| 7. Local AI Feedback     | [feedback.py](src/eda/feedback.py)           | `POST /feedback/run`, `/feedback/recommendations` |
+| Request flow             | [gateway.py](src/eda/gateway.py)             | `POST /requests`, `POST /approvals/{id}/decision` |
 
-## 6. Credential Storage
+## How the design principles show up in code
 
-Do not persist usable broker credentials as plaintext JSON. Store credentials in the broker, vault, or controlled executor and retain only opaque references and redacted metadata in the control plane.
+- **Authority before context** — [objects.py](src/eda/objects.py) refuses to return context without a validated grant; the gateway only reaches the object graph after the policy decision and broker step.
+- **Separate access from ontology** — `access_nodes`/`access_edges` and `object_nodes`/`object_edges` are distinct graphs ([models.py](src/eda/models.py)); the access graph proves paths, the object graph explains meaning.
+- **Temporary authority over standing privilege** — every grant is scoped to one action + one resource with a TTL capped by policy obligations ([broker.py](src/eda/broker.py)). `AwsStsBroker` shows the real `sts:AssumeRole` + session-policy seam.
+- **Deterministic gates before action** — [policy.py](src/eda/policy.py) evaluates a closed set of condition keys against versioned policy documents. Deny > require_approval > allow; default deny. No model anywhere in the decision path.
+- **Local-first by default** — SQLite/Postgres inside your boundary; no external calls anywhere in the codebase.
+- **Audit everything** — one hash-chained record per outcome carrying identity, path proof, policy input/decision/version, approval, redacted grant, API calls, and context summary. `GET /audit/verify` walks the chain; tampering breaks it (proven in [test_audit.py](tests/test_audit.py)).
+- **AI observes and proposes; deterministic systems approve and enforce** — [feedback.py](src/eda/feedback.py) analyzers only ever create `proposed` recommendations; a human decision (itself audited) is required, and applying a change is a separate versioned act. `NarrativeGateway` is the seam for a customer-hosted local model.
 
-## 7. Grant Lifetime Consistency
+## Secure enterprise front
 
-Ensure the real provider credential lifetime never exceeds the grant lifetime enforced by the control plane. Revocation and expiration behavior must remain consistent across both systems.
+Identity and access relationships come from trusted enterprise inputs, not from callers:
 
-## 8. Controlled Runner Implementation
+- **OIDC authentication** — `EDA_AUTH_MODE=oidc` validates bearer tokens (Okta, Entra ID, Keycloak, any standard provider): JWKS signature, issuer, audience, expiry, stable subject, tenant, and MFA assurance from `amr`/`acr` claims. Callers cannot choose their identity, MFA status, or risk score; the dev session endpoint is disabled. See [.env.example](.env.example) for provider configuration.
+- **Identity-to-graph mapping** — a verified token resolves as `issuer + subject → tenant + canonical external ID → existing AccessNode`. Unknown identities, tenant mismatches, and identities asserted by disabled or stale sources all fail closed before policy ever runs ([identity_providers.py](src/eda/identity_providers.py)).
+- **Collector ingestion** — registered sources (e.g. `okta-directory-prod`) push relationship batches with a source-bound credential. Each source is confined to its namespace (`okta:`), so a collector can never write another tenant's or source's relationships. Batches are validated atomically (schema, kinds, relations, batch size) and every imported node/edge records `tenant_id`, `external_id`, `source_id`, and `observed_at` ([ingestion.py](src/eda/ingestion.py)).
+- **Unchanged downstream** — imported relationships feed the existing path resolver; policy, broker, object graph, actions, and audit are untouched. Seeded identities remain available only to the dev provider for tests and local demos.
 
-Replace the current in-process execution label with an actual controlled execution boundary. It should contain credentials, enforce timeouts and resource limits, isolate jobs, and return only approved outputs.
+## Seeded example environment
 
-## 9. Typed Action Input Validation
+Matches the design doc's example: `user:derrick → member_of group:security-engineers → assigned permission_set:prod-readonly → can_assume role:prod-security-auditor → role_allows ec2:Describe* → account:prod → asset:ec2-prod-1`, plus a privileged `prod-secops` path for rotation/containment, `marcus` (path but weak sessions), and `eve` (contractor, no path). The object graph models `payments-api`, its instance, VPC, secret, database, cardholder data, finding `F-2026-0142`, and incident `INC-42`. See [seed.py](src/eda/seed.py).
 
-Give every action a strict input schema with types, allowed values, length and size limits, and unknown-field rejection. Required-key checks alone are not sufficient.
+## What is real vs. mocked
 
-## 10. Audit-Chain Concurrency
+Real: path resolution, policy evaluation, grant scoping/TTL/validation, approval workflow (with self-approval rejection), context scoping with sensitive-attribute redaction, hash-chained audit with tamper detection, feedback analyzers with human gating.
 
-Serialize or otherwise coordinate audit appends so concurrent transactions cannot use the same previous hash and create competing chain heads.
+Real: OIDC token validation (full JWKS/issuer/audience/expiry/tenant/MFA verification — point it at a real Okta or Entra app), fail-closed identity mapping, and collector ingestion with namespace confinement and provenance.
 
-## 11. Audit Durability and External Anchoring
+Mocked/stand-in (each behind a production seam): the dev identity provider (tests/local demos only), cloud credentials (`MockStsBroker` → `AwsStsBroker`/GCP impersonation/Azure PIM), action handlers (mock API calls → real SDK calls inside the controlled runner), narrative summaries (templates → local LLM gateway).
 
-The local hash chain detects modification but can be recomputed by a database administrator. Sign or periodically anchor chain heads in an independent, immutable trust domain.
-
-## 12. Tenant Isolation
-
-Add and enforce tenant scope for identities, graph nodes, graph edges, resources, approvals, grants, policy decisions, recommendations, and audit queries. Isolation must be enforced in persistence and service logic.
-
-## 13. Policy Lifecycle Management
-
-Add controlled workflows for proposing, validating, testing, activating, rolling back, and auditing policy versions. Policy changes must not become active through direct database edits.
-
-## 14. Feedback Analyzer Accuracy
-
-Normalize capability and observed API-call identifiers before comparing granted and exercised authority. Prevent naming differences from creating false least-privilege recommendations.
-
-## 15. Operational Durability
-
-Add database migrations, idempotency controls, retry policies, background-job handling, health checks, metrics, tracing, backup and restoration procedures, and documented recovery behavior.
-
-## Implementation Rule
-
-Address these as separate, reviewable work packages. Do not rewrite the full architecture to complete an individual item. Each change should preserve the existing request flow unless that item's accepted design explicitly requires otherwise.
+Production hardening not included here: migrations (Alembic), external audit anchoring (object-lock / transparency log), approver authorization policies, rate limiting, mTLS between components, HA.

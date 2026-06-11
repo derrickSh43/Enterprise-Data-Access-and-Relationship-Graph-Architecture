@@ -1,0 +1,19 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: eda
+      POSTGRES_PASSWORD: eda-dev-only
+      POSTGRES_DB: eda
+    ports:
+      - "5432:5432"
+    volumes:
+      - eda-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U eda"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  eda-pgdata:
