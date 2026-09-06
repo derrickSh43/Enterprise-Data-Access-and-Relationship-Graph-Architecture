@@ -1,5 +1,7 @@
 # Enterprise Data Access (EDA)
 
+**New here? Read the [Simple README](SIMPLE_README.md)** for the value, setup story and an example agent workflow in everyday language.
+
 **A foundation for giving AI agents controlled access to company data, on behalf of the people who task them.**
 
 An agent might need to find a document, inspect a cloud resource, or answer a question using a database. Before it receives anything, a system needs to answer:
