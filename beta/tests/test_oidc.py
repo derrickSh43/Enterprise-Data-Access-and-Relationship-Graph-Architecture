@@ -57,7 +57,7 @@ def test_valid_token_yields_mapped_session(provider, signing_key):
     assert session.tenant == "acme"
     assert session.issuer == ISSUER
     assert session.mfa is True
-    assert session.risk_score == 0  # server-derived, never caller-supplied
+    assert session.risk_score is None  # unavailable is not a known-safe score
     assert "security-engineers" in session.groups
 
 

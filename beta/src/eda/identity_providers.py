@@ -9,7 +9,7 @@ acquires an identity. Two implementations:
   Entra ID, Keycloak, ...): JWKS signature, issuer, audience, expiry, stable
   subject, tenant, and MFA assurance from amr/acr. Callers cannot choose
   their identity, MFA status, or risk score - those come from validated
-  claims (risk is server-derived and defaults to 0).
+  claims (risk remains unknown until a trusted risk integration supplies it).
 
 `map_principal` turns a verified session into an existing AccessNode via
 issuer+subject -> tenant + canonical external ID. No mapped node, a tenant
@@ -89,8 +89,9 @@ class OidcConfig:
     provider_prefix: str = "oidc"     # canonical external IDs become "<prefix>:<sub>"
     tenant_claim: str = "tid"
     static_tenant: str = ""           # for single-tenant providers (e.g. one Okta org)
+    external_id_claim: str = "sub"
     groups_claim: str = "groups"
-    mfa_amr: frozenset = frozenset({"mfa", "otp", "hwk", "swk"})
+    mfa_amr: frozenset = frozenset({"mfa"})
     mfa_acr: frozenset = frozenset()
     algorithms: tuple = ("RS256", "ES256")
     leeway_seconds: int = 30
@@ -124,32 +125,50 @@ class OidcIdentityProvider(IdentityProvider):
             raise InvalidSession(f"oidc: {exc}")
 
         subject = claims["sub"]
-        tenant = claims.get(cfg.tenant_claim) or cfg.static_tenant
+        if not isinstance(subject, str) or not subject.strip():
+            raise InvalidSession("oidc: subject must be a non-empty string")
+        claimed_tenant = claims.get(cfg.tenant_claim)
+        if claimed_tenant is not None and (not isinstance(claimed_tenant, str) or not claimed_tenant.strip()):
+            raise InvalidSession("oidc: tenant must be a non-empty string")
+        if cfg.static_tenant and claimed_tenant is not None and claimed_tenant != cfg.static_tenant:
+            raise InvalidSession("oidc: tenant differs from configured tenant")
+        tenant = claimed_tenant or cfg.static_tenant
         if not tenant:
             raise InvalidSession("oidc: token carries no tenant and no static tenant configured")
 
-        amr = set(claims.get("amr") or [])
-        mfa = bool(amr & cfg.mfa_amr) or (claims.get("acr") in cfg.mfa_acr)
+        amr_claim = claims.get("amr", [])
+        if not isinstance(amr_claim, list) or any(not isinstance(v, str) for v in amr_claim):
+            raise InvalidSession("oidc: amr must be a list of strings")
+        acr = claims.get("acr")
+        if acr is not None and not isinstance(acr, str):
+            raise InvalidSession("oidc: acr must be a string")
+        mfa = bool(set(amr_claim) & cfg.mfa_amr) or (acr in cfg.mfa_acr)
 
-        groups = claims.get(cfg.groups_claim) or []
-        if not isinstance(groups, list):
-            groups = [groups]
+        groups = claims.get(cfg.groups_claim, [])
+        if not isinstance(groups, list) or any(not isinstance(v, str) for v in groups):
+            raise InvalidSession("oidc: groups must be a list of strings")
+        for name in ("sid", "jti"):
+            if name in claims and (not isinstance(claims[name], str) or not claims[name].strip()):
+                raise InvalidSession(f"oidc: {name} must be a non-empty string")
 
         session_id = (
             claims.get("sid")
             or claims.get("jti")
             or hashlib.sha256(token.encode()).hexdigest()[:32]
         )
+        external_subject = claims.get(cfg.external_id_claim)
+        if not isinstance(external_subject, str) or not external_subject.strip():
+            raise InvalidSession("oidc: configured external identity claim missing or invalid")
         return SessionInfo(
             session_id=session_id,
             subject=subject,
             mfa=mfa,
-            risk_score=0,  # server-derived only; never caller-supplied
+            risk_score=None,  # no trusted risk integration is configured
             tags={"iss": cfg.issuer, "tenant": tenant},
             expires_at=float(claims["exp"]),
             issuer=cfg.issuer,
             tenant=tenant,
-            external_id=f"{cfg.provider_prefix}:{subject}",
+            external_id=f"{cfg.provider_prefix}:{external_subject}",
             groups=tuple(groups),
         )
 
@@ -186,6 +205,7 @@ def get_identity_provider() -> IdentityProvider:
                     tenant_claim=settings.oidc_tenant_claim,
                     static_tenant=settings.oidc_static_tenant,
                     groups_claim=settings.oidc_groups_claim,
+                    external_id_claim=settings.oidc_external_id_claim,
                     mfa_amr=frozenset(
                         v.strip() for v in settings.oidc_mfa_amr.split(",") if v.strip()
                     ),
@@ -196,7 +216,9 @@ def get_identity_provider() -> IdentityProvider:
                 RemoteJwksKeySource(settings.oidc_jwks_url),
             )
         return _oidc_cached
-    return DevIdentityProvider()
+    if settings.auth_mode == "dev" and settings.demo_enabled:
+        return DevIdentityProvider()
+    raise RuntimeError("unsupported or unsafe authentication configuration")
 
 
 # ---------------------------------------------------------------------------
@@ -216,25 +238,42 @@ def map_principal(db: Session, session: SessionInfo) -> AccessNode | None:
     relationship source that is unknown, disabled, or stale; or the node is
     seeded (no source) while the session is not a dev session.
     """
-    if not session.external_id:
+    if not session.external_id or not session.tenant:
         return None
-    node = db.scalar(select(AccessNode).where(AccessNode.external_id == session.external_id))
-    if node is None or node.kind != "user":
-        return None
-    if session.tenant and node.tenant_id and node.tenant_id != session.tenant:
-        return None
+    external_id = session.external_id
+    source_id = None
+    if session.issuer != "dev" and settings.oidc_directory_source:
+        # Deployment-owned issuer -> directory binding; collectors cannot choose it.
+        prefix = settings.oidc_provider_prefix + ":"
+        if session.issuer != settings.oidc_issuer or not external_id.startswith(prefix):
+            return None
+        external_id = settings.oidc_native_id_prefix + external_id[len(prefix):]
+        if not external_id:
+            return None
+        source_id = settings.oidc_directory_source
+    query = select(AccessNode).where(
+        AccessNode.external_id == external_id,
+        AccessNode.tenant_id == session.tenant,
+        AccessNode.kind == "user",
+    )
+    if source_id is not None:
+        query = query.where(AccessNode.source_id == source_id)
+    candidates = db.scalars(query.limit(2)).all()
+    if len(candidates) != 1:
+        return None  # ambiguous identity is never resolved by row ordering
+    node = candidates[0]
 
     if node.source_id is None:
         # Seeded principal: honored only for dev sessions (tests/local demos).
         return node if session.issuer == "dev" else None
 
     source = db.get(RelationshipSource, node.source_id)
-    if source is None or not source.enabled:
+    if source is None or not source.enabled or source.tenant_id != session.tenant:
         return None
     last_sync = _aware(source.last_sync_at)
     if last_sync is None:
         return None
     age = datetime.now(timezone.utc) - last_sync
-    if age.total_seconds() > settings.source_max_age_seconds:
+    if age.total_seconds() < 0 or age.total_seconds() > settings.source_max_age_seconds:
         return None
     return node

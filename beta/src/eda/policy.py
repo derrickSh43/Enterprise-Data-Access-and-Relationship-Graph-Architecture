@@ -19,10 +19,23 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .models import PolicyRecord
+from .config import settings
 
 DEFAULT_POLICY = {
-    "version": "2026-06-11.1",
+    "version": "2026-09-06.1",
     "rules": [
+        {
+            "id": "deny-unknown-risk-write",
+            "description": "Unknown session risk cannot authorize writes.",
+            "effect": "deny",
+            "when": {"session_risk_unknown": True, "action_read_only": False},
+        },
+        {
+            "id": "deny-unknown-risk-sensitive",
+            "description": "Unknown session risk cannot authorize sensitive access.",
+            "effect": "deny",
+            "when": {"session_risk_unknown": True, "resource_classification": "sensitive"},
+        },
         {
             "id": "deny-no-access-path",
             "description": "No proven authority path means no access, ever.",
@@ -72,7 +85,7 @@ DEFAULT_POLICY = {
             "effect": "allow",
             "when": {"action_read_only": False},
             "obligations": [
-                {"type": "max_ttl_seconds", "value": 300},
+                {"type": "max_ttl_seconds", "value": 900},
                 {"type": "controlled_runner"},
             ],
         },
@@ -83,7 +96,8 @@ DEFAULT_POLICY = {
 _CONDITIONS = {
     "access_path_exists": lambda inp, v: inp["access_path_exists"] == v,
     "session_mfa": lambda inp, v: inp["session"]["mfa"] == v,
-    "session_risk_above": lambda inp, v: inp["session"]["risk_score"] > v,
+    "session_risk_above": lambda inp, v: inp["session"].get("risk_score") is not None and inp["session"]["risk_score"] > v,
+    "session_risk_unknown": lambda inp, v: (inp["session"].get("risk_score") is None) == v,
     "action_read_only": lambda inp, v: inp["action"]["read_only"] == v,
     "resource_environment": lambda inp, v: inp["resource"].get("environment") == v,
     "resource_classification": lambda inp, v: inp["resource"].get("classification") == v,
@@ -123,6 +137,8 @@ def checksum(document: dict) -> str:
 def active_policy(db: Session) -> PolicyRecord:
     record = db.scalar(select(PolicyRecord).where(PolicyRecord.status == "active"))
     if record is None:
+        if settings.environment == "production":
+            raise PolicyError("production requires an explicitly activated policy")
         record = PolicyRecord(
             version=DEFAULT_POLICY["version"],
             document=DEFAULT_POLICY,
@@ -159,7 +175,7 @@ _SIMULATION_INPUTS = [
         "access_path_exists": path, "justification": just, "approval_present": ap,
     }
     for mfa in (True, False)
-    for risk in (0, 99)
+    for risk in (None, 0, 99)
     for ro in (True, False)
     for env in ("production", None)
     for cls in ("sensitive", "internal")

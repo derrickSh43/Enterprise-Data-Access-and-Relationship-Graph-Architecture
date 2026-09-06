@@ -26,7 +26,7 @@ class SessionInfo:
     session_id: str
     subject: str
     mfa: bool
-    risk_score: int
+    risk_score: int | None
     tags: dict
     expires_at: float
     # Identity provenance: which provider asserted this session and the

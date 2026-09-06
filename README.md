@@ -1,513 +1,89 @@
-# Enterprise-Data-Access-and-Relationship-Graph-Architecture
+# Enterprise Data Access (EDA)
 
-<img width="1920" height="1080" alt="Screenshot 2026-06-11 064218" src="https://github.com/user-attachments/assets/7f0e3228-a194-4920-a6c5-bb5b00e59f14" />
+**A foundation for giving AI agents controlled access to company data, on behalf of the people who task them.**
 
+An agent might need to find a document, inspect a cloud resource, or answer a question using a database. Before it receives anything, a system needs to answer:
 
-A security-first architecture for mapping enterprise authority, operational objects, workflow actions, and AI-assisted feedback loops without centralizing sensitive context inside a third-party SaaS platform.
+- Which agent is asking, and who authorized its task?
+- What is that person currently allowed to access?
+- What part of that access was delegated to this task?
+- What information can be returned, and what evidence should be recorded?
 
-## Overview
+EDA is being built to answer those questions across different systems, while keeping the control plane in the organization's own environment.
 
-Modern enterprises are increasingly dependent on platforms that centralize operational context: cloud assets, identities, workflows, policies, risks, alerts, business objects, and decision history.
+> **Current status: a working inventory and identity sandbox, not a finished agent authorization product.** Live Entra/AWS collection and local recovery have been tested. Carrying both the agent and user identities, task delegation, and comprehensive native data permissions still need implementation. Production startup is deliberately blocked.
 
-That centralization is powerful, but it also creates a growing security problem.
+## What it does today
 
-As AI systems become better at reasoning over complex environments, any platform that stores a normalized map of an organization becomes a high-value target. What used to be a dashboard can become an attack-planning substrate.
+EDA collects information about users, groups and resources and builds a relationship graph: a connected map of those records. It records where the information came from, replaces old information after a complete synchronization, and rejects stale evidence in supported access paths.
 
-This architecture proposes a local-first alternative:
+The current sandbox connects:
 
-- Keep sensitive operational context inside the customer boundary.
-- Separate access mapping from object modeling.
-- Use deterministic policy gates before any action.
-- Broker temporary authority instead of granting standing privilege.
-- Treat AI as an observer and recommender, not an unchecked executor.
-- Maintain full auditability of every decision, action, and policy change.
+| Component | Its job |
+| --- | --- |
+| Microsoft Entra ID | Supplies users, groups and verified human sign-in identities |
+| AWS | Supplies metadata about buckets, IAM roles and EC2 instances |
+| EDA, running locally | Imports relationships, applies supported checks and records audit evidence |
+| Local PostgreSQL | Stores the graph, synchronization state and audit records |
 
-The goal is not to eliminate risk. The goal is to reduce risk, shrink blast radius, and make every action explainable and recoverable.
+The connectors collect **metadata**: information describing resources. The sandbox does not download S3 documents, copy database rows or give an agent general access to your cloud account.
 
-## Core Idea
-
-Most enterprise platforms focus on collecting data first.
-
-This architecture starts with authority.
-
-Before asking:
-
-> What does this object connect to?
-
-The system asks:
-
-> Who is asking, what authority path exists, should that authority be honored, and how can the action be safely executed?
-
-The platform is built around six core systems plus a local AI feedback loop.
-
-```text
-1. Access Graph
-2. Policy Engine
-3. Authority Broker
-4. Object / Ontology Graph
-5. Action / Workflow Layer
-6. Audit / Evidence Layer
-7. Local AI Feedback Loop
+```mermaid
+flowchart LR
+    Entra["Entra: users and groups"] -->|"Metadata"| EDA["Local EDA application"]
+    AWS["AWS: resource inventory"] -->|"Metadata"| EDA
+    EDA <--> DB["Local PostgreSQL"]
+    Person["Test user"] -->|"Verified sign-in"| EDA
 ```
 
-## Architecture Components
+## The intended agent model
 
-### 1. Access Graph
+Every agent request must carry **both the agent's identity and the identity of the person who authorized its work**, backed by a valid delegation. There is no planned agent-only authority path for autonomous agents.
 
-The Access Graph maps authority relationships across the enterprise.
+An agent's access must stay within the user's current permissions, the delegated task scope and any additional restrictions. An agent ID provides accountability; it does not grant access by itself.
 
-It answers:
+**That model is a design requirement, not a capability already delivered by this repository.** The directory collector is an operator-run infrastructure tool, not an autonomous data-access agent.
 
-> What access paths exist?
+## Why the graph and connector SDK matter
 
-In cloud environments, this may include:
+The graph helps explain how identities and resources relate. The connector SDK gives different systems a common way to send objects and relationships to EDA.
 
-- IAM users
-- IAM roles
-- IAM groups
-- SSO permission sets
-- trust policies
-- identity policies
-- resource policies
-- permission boundaries
-- SCPs
-- session tags
-- service accounts
-- workload identities
-- Kubernetes RBAC
-- database grants
-- SaaS permissions
-- HR and team relationships
+Different providers still have different permission rules. A line connecting a user to a resource is not proof of native access. AWS and PostgreSQL effective-permission evaluation remains incomplete; inventory records do not automatically become grants.
 
-Example access path:
+## Start here
 
-```text
-user:derrick
-  -> member_of group:security-engineers
-  -> assigned permission_set:prod-readonly
-  -> can_assume role:prod-security-auditor
-  -> role_allows ec2:DescribeInstances
-  -> account_contains asset:ec2-prod-1
-```
+1. **[Install the sandbox](INSTALL.md)** — prerequisites, setup order and exact commands.
+2. **[Use and test EDA](docs/USAGE.md)** — start services, import real metadata, check sign-in and interpret results.
+3. **[See current capabilities and limits](docs/IMPLEMENTATION_STATUS.md)** — what is implemented, tested and still outstanding.
+4. **[Review the design roadmap](PRODUCTION_ROADMAP.md)** — the larger production plan.
 
-The Access Graph does not decide final authorization by itself. It discovers and proves relationship paths.
+The connected setup order is **Entra and AWS → generate local settings → start Docker → import and test**. Entra and AWS can be configured in either order. Install Docker Desktop at any time.
 
-### 2. Policy Engine
+## What has been tested
 
-The Policy Engine evaluates whether an access path should be honored.
+A sandbox run passed 21 live/local checks, covering real Entra/AWS imports, stored-record matching, authentication refusals, repeated imports, controlled import interruption, restricted AWS reads, audit hash verification and local container restart recovery.
 
-This can be implemented with a deterministic policy engine such as OPA, Cedar, or a custom internal policy evaluator.
+This does **not** prove agent delegation, provider-side membership revocation, complete native permission evaluation or production readiness. Interactive human sign-in was not completed in that run. See the [sanitized test summary](docs/LIVE_TEST_SUMMARY.md).
 
-It answers:
+## Small sandbox, larger production work
 
-> Given this subject, action, resource, access path, session state, and risk context, should the request be allowed?
+The initial setup runs EDA and PostgreSQL on your computer. AWS contains one small EC2 inspection target and a private S3 bucket. The instance defaults to stopped; its disk still incurs storage charges. There is no AWS API Gateway, NAT gateway, load balancer or hosted database in the small sandbox module.
 
-Example policy factors:
+The separate `infra/` directory is a broader infrastructure foundation. It is **not** the small sandbox and does not yet deploy a complete production application. Kubernetes packaging is not implemented.
 
-- Does an access path exist?
-- Is MFA present?
-- Is the session risk acceptable?
-- Is the action high risk?
-- Is approval required?
-- Is the resource classified as sensitive?
-- Does the request involve production?
-- Is the access temporary?
-- Does a policy deny override the allow?
+## Repository guide
 
-The Policy Engine should not become the full object graph or identity provider. It should evaluate trusted input and synced policy data.
+| Location | Contents |
+| --- | --- |
+| `sandbox/` | Connected sandbox setup and operator test tools |
+| `deploy/` | Dockerfile and a separate local-only demo composition |
+| `beta/` | Python application, migrations and tests |
+| `contracts/v1/` | Versioned connector JSON schemas |
+| `docs/` | Usage, connectors, migrations, limitations and security design |
+| `infra/` | Incomplete broader deployment foundation; not the first-install path |
 
-### 3. Authority Broker
+## Keep private configuration private
 
-The Authority Broker turns an approved decision into real temporary authority.
+Use a disposable test tenant/account and synthetic data. Never commit `.env`, real `.tfvars`, Terraform state/plans, credentials, database files or raw diagnostics. The repository includes templates, not real account settings. Terraform can store generated secrets in its state even when outputs are marked sensitive.
 
-It answers:
-
-> How does an approved decision become safe, cloud-native or system-native access?
-
-For AWS, this could use:
-
-- STS AssumeRole
-- short-lived credentials
-- scoped session policies
-- session tags
-- permission boundaries
-- CloudTrail correlation
-
-For GCP:
-
-- service account impersonation
-- IAM Credentials API
-- Workload Identity Federation
-- IAM Conditions
-
-For Azure:
-
-- Privileged Identity Management
-- managed identities
-- Entra ID
-- Azure RBAC
-- conditional access
-
-For other enterprise systems:
-
-- temporary database grants
-- scoped API tokens
-- approval-based workflow authority
-- delegated SaaS permissions
-- controlled execution runners
-
-The broker should prefer short-lived, scoped, auditable access over standing privilege.
-
-For high-risk actions, the platform should execute through a controlled runner instead of handing credentials directly to the user or agent.
-
-### 4. Object / Ontology Graph
-
-The Object Graph models operational reality.
-
-It answers:
-
-> What is this object, and how is it connected to everything else?
-
-Example object types:
-
-- application
-- service
-- cloud account
-- VPC
-- subnet
-- Kubernetes cluster
-- namespace
-- pod
-- secret
-- database
-- storage bucket
-- identity
-- incident
-- ticket
-- customer
-- supplier
-- transaction
-- policy
-- business process
-
-Example relationships:
-
-```text
-application runs_on kubernetes_cluster
-cluster contains namespace
-namespace contains pod
-pod uses secret
-secret accesses database
-database stores customer_data
-finding affects asset
-asset belongs_to application
-application owned_by team
-```
-
-The Object Graph should not decide access by itself.
-
-Access is resolved through the Access Graph and Policy Engine first. Only then should the object graph return scoped context.
-
-### 5. Action / Workflow Layer
-
-The Action Layer defines what can be done.
-
-It answers:
-
-> What actions are available, and what workflow governs them?
-
-Example actions:
-
-- view asset
-- investigate incident
-- quarantine workload
-- rotate secret
-- open ticket
-- approve request
-- update ownership
-- trigger deployment
-- disable access
-- escalate finding
-- reroute process
-- generate report
-
-Actions should be defined as controlled verbs, not arbitrary tool execution.
-
-Each action should include:
-
-- required authority
-- required policy checks
-- required approvals
-- allowed inputs
-- expected outputs
-- rollback behavior
-- audit requirements
-- blast-radius limits
-
-### 6. Audit / Evidence Layer
-
-The Audit Layer records what happened, why it happened, and under what authority.
-
-It answers:
-
-> What happened, who approved it, which policy allowed it, and what changed?
-
-The audit layer should capture:
-
-- subject identity
-- session identity
-- requested action
-- target object
-- access path proof
-- policy input
-- policy decision
-- policy version
-- approval record
-- brokered authority details
-- executed API calls
-- object graph context returned
-- result of the action
-- errors and retries
-- timestamps
-- correlation IDs
-
-For high-trust systems, audit logs should be append-only and tamper-resistant.
-
-## 7. Local AI Feedback Loop
-
-The AI feedback loop is local-only and customer-owned.
-
-It observes system behavior and recommends improvements without directly changing authority, policy, workflows, or objects.
-
-It answers:
-
-> What patterns are emerging, and what improvements should humans or policy gates consider?
-
-Potential uses:
-
-- summarize incident outcomes
-- identify repeated approval bottlenecks
-- recommend policy improvements
-- suggest ontology updates
-- detect access drift patterns
-- generate human-readable reports
-- identify risky access paths
-- suggest workflow simplification
-- improve context retrieval
-- explain why an action was allowed or denied
-
-The core rule:
-
-> AI observes and proposes. Deterministic systems approve and enforce.
-
-Example feedback loop:
-
-```text
-Audit logs
-Policy decisions
-Workflow results
-Object graph changes
-Access graph drift
-Incident outcomes
-        ↓
-Local model / local RAG / local analytics
-        ↓
-Recommendation
-        ↓
-Human or policy-gated approval
-        ↓
-Versioned update to graph, policy, or workflow
-        ↓
-Audit record
-```
-
-## Request Flow
-
-A typical request flows through the system like this:
-
-```text
-User or agent makes request
-        ↓
-Identity is authenticated
-        ↓
-Access Graph resolves authority path
-        ↓
-Policy Engine evaluates request
-        ↓
-Authority Broker creates temporary scoped authority
-        ↓
-Object Graph returns approved context
-        ↓
-Action Layer executes or routes workflow
-        ↓
-Audit Layer records the full chain
-        ↓
-Local AI Feedback Loop learns from the outcome
-```
-
-## Example: Cloud Investigation Request
-
-Request:
-
-```text
-User wants to inspect a production EC2 instance related to a security incident.
-```
-
-Flow:
-
-```text
-1. User authenticates through SSO.
-2. Access Graph checks group, role, permission set, account, and resource relationships.
-3. Policy Engine verifies MFA, session risk, production access, case ID, and action type.
-4. Authority Broker assumes a scoped AWS role using STS.
-5. Object Graph returns only approved context about the EC2 instance, app, VPC, findings, and owner.
-6. Action Layer allows read-only inspection.
-7. Audit Layer records identity, policy decision, session tags, returned context, and API calls.
-8. Local AI summarizes the investigation and may recommend workflow or policy improvements.
-```
-
-## Why This Is Different From SaaS-First Platforms
-
-Many enterprise platforms centralize data into vendor-owned SaaS environments.
-
-That model provides fast onboarding and strong dashboards, but it can also create target concentration.
-
-This architecture assumes that sensitive enterprise context should remain inside the customer boundary by default.
-
-Instead of:
-
-```text
-Enterprise systems -> third-party SaaS -> centralized vendor-owned intelligence graph
-```
-
-This model prefers:
-
-```text
-Enterprise systems -> customer-owned control plane -> local graph, local policy, local AI, local audit
-```
-
-The vendor, if any, should provide software, updates, detection packs, models, support, and optional analytics — not become the default holder of the customer’s operational attack map.
-
-## Palantir-Like, But Authority-First
-
-This architecture overlaps with Palantir-style ideas because it uses enterprise objects, relationships, workflows, and AI-assisted reasoning.
-
-The key difference is the starting point.
-
-Palantir-like model:
-
-```text
-Data -> Ontology -> Applications -> Workflows -> AI
-```
-
-This model:
-
-```text
-Authority -> Policy -> Brokered Access -> Scoped Context -> Governed Action -> Audit -> Local AI Feedback
-```
-
-It is not only modeling operational reality.
-
-It is also modeling authority over operational reality.
-
-## Design Principles
-
-### 1. Authority before context
-
-Do not query the object graph until the subject’s authority has been evaluated.
-
-### 2. Separate access from ontology
-
-The Access Graph and Object Graph should be connected but separate.
-
-Access relationships answer who can reach what.
-
-Object relationships answer what things mean and how they connect.
-
-### 3. Temporary authority over standing privilege
-
-Use short-lived, scoped authority whenever possible.
-
-### 4. Deterministic gates before action
-
-AI should never be the final enforcement layer.
-
-### 5. Local-first by default
-
-Sensitive operational graphs, findings, access paths, and audit trails should remain inside the customer boundary.
-
-### 6. Audit everything
-
-Every decision should be explainable and reconstructable.
-
-### 7. Reduce blast radius
-
-Security is not about removing all risk. It is about reducing risk, controlling blast radius, and improving recovery.
-
-## Potential Implementation Stack
-
-This is one possible implementation path.
-
-```text
-Identity:          OIDC, SAML, Entra ID, Okta, Keycloak
-Access Graph:      Custom graph service, Neo4j, TypeDB, Postgres graph model
-Policy Engine:     OPA, Cedar, custom deterministic policy evaluator
-Authority Broker:  AWS STS, GCP service account impersonation, Azure PIM, scoped runners
-Object Graph:      Neo4j, TypeDB, RDF store, Postgres, custom ontology service
-Workflow Layer:    Temporal, Argo Workflows, FastAPI, internal job runners
-Audit Layer:       Append-only log, object storage, SIEM, Loki, OpenSearch
-AI Loop:           Local LLM, local RAG, customer-hosted model gateway
-UI:                React, internal portal, CLI, IDE plugin, chat interface
-```
-
-## What This Is Not
-
-This is not a replacement for IAM, RBAC, ABAC, or cloud-native enforcement.
-
-It is not a generic dashboard.
-
-It is not an AI agent with unrestricted tools.
-
-It is not a system where the model decides what is safe.
-
-It is a governed control plane that composes identity, access relationships, policy decisions, temporary authority, object context, workflows, audit evidence, and local AI recommendations.
-
-## Future Extensions
-
-Possible future capabilities:
-
-- policy simulation
-- access path diffing
-- blast-radius previews
-- approval workflow templates
-- AI-generated policy recommendations
-- graph drift detection
-- least-privilege recommendations
-- cross-cloud authority mapping
-- Kubernetes-native action broker
-- incident response playbooks
-- secure agent execution sandboxes
-- SIEM/SOAR integrations
-- model gateway integration
-- local-only enterprise RAG
-- rollback and versioning for graphs, policies, and workflows
-
-## Summary
-
-This architecture is a local-first governed enterprise control plane.
-
-It combines:
-
-```text
-Access Graph
-+ Policy Engine
-+ Authority Broker
-+ Object / Ontology Graph
-+ Action / Workflow Layer
-+ Audit / Evidence Layer
-+ Local AI Feedback Loop
-```
-
-The core philosophy is simple:
-
-> Model authority, evaluate policy, broker temporary access, scope context, govern actions, audit everything, and let AI recommend — not enforce.
+The evidence tools produce a separate public report with predefined outcomes. Only share that report after reviewing it; do not publish the raw diagnostic folder. Nothing is uploaded automatically.

@@ -27,14 +27,21 @@ class RunnerTimeout(RunnerError):
     pass
 
 
-def _child(conn, handler_path: str, credentials: dict, resource: str, inputs: dict) -> None:
+def _child(conn, handler_path: str, credentials: dict, resource: str, inputs: dict, max_bytes: int) -> None:
+    import os
+    import sys
+    sys.stdout = open(os.devnull, "w")
+    sys.stderr = open(os.devnull, "w")
     try:
         module_name, func_name = handler_path.rsplit(".", 1)
         handler = getattr(importlib.import_module(module_name), func_name)
         outputs, api_calls = handler(credentials, resource, inputs)
-        conn.send({"ok": True, "outputs": outputs, "api_calls": api_calls})
+        payload = json.dumps({"ok": True, "outputs": outputs, "api_calls": api_calls}, default=str).encode()
+        if len(payload) > max_bytes:
+            payload = b'{"ok":false,"error":"output exceeds byte limit"}'
+        conn.send_bytes(payload)
     except Exception as exc:  # report, never crash silently
-        conn.send({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+        conn.send_bytes(json.dumps({"ok": False, "error": type(exc).__name__}).encode())
     finally:
         conn.close()
 
@@ -51,12 +58,18 @@ def run_controlled(
 ) -> tuple[dict, list]:
     """Execute a handler in an isolated process; return (outputs, api_calls)
     with outputs filtered to the action's approved keys."""
+    if settings.runner_backend == "docker":
+        from .container_runner import run_container
+        return run_container(handler_path, credentials=credentials, resource=resource, inputs=inputs,
+                             allowed_outputs=allowed_outputs, timeout_seconds=timeout_seconds,
+                             max_output_bytes=max_output_bytes)
     timeout = timeout_seconds or settings.runner_timeout_seconds
+    limit = max_output_bytes or settings.runner_max_output_bytes
     ctx = multiprocessing.get_context("spawn")
     parent_conn, child_conn = ctx.Pipe(duplex=False)
     proc = ctx.Process(
         target=_child,
-        args=(child_conn, handler_path, credentials, resource, inputs),
+        args=(child_conn, handler_path, credentials, resource, inputs, limit),
         daemon=True,
     )
     proc.start()
@@ -64,7 +77,10 @@ def run_controlled(
     try:
         if not parent_conn.poll(timeout):
             raise RunnerTimeout(f"controlled runner exceeded {timeout}s; job terminated")
-        result = parent_conn.recv()
+        try:
+            result = json.loads(parent_conn.recv_bytes(maxlength=limit))
+        except (OSError, EOFError, ValueError) as exc:
+            raise RunnerError("invalid or oversized runner response") from exc
     finally:
         if proc.is_alive():
             proc.terminate()
@@ -80,6 +96,8 @@ def run_controlled(
         raise RunnerError(f"runner output exceeds {limit} byte limit")
 
     outputs = {k: v for k, v in result["outputs"].items() if k in allowed_outputs}
+    from .runner_output import reject_credentials
+    reject_credentials({"outputs": outputs, "api_calls": result["api_calls"]}, credentials)
     return outputs, result["api_calls"]
 
 

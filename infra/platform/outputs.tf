@@ -1,0 +1,9 @@
+output "database_endpoint" { value = aws_db_instance.database.address }
+output "database_bootstrap_secret_arn" { value = aws_db_instance.database.master_user_secret[0].secret_arn }
+output "audit_bucket" { value = aws_s3_bucket.audit.id }
+output "job_queue_url" { value = aws_sqs_queue.jobs.url }
+output "image_repository" { value = aws_ecr_repository.application.repository_url }
+output "cluster_arn" { value = aws_ecs_cluster.application.arn }
+output "application_role_arn" { value = aws_iam_role.application.arn }
+output "broker_role_arn" { value = aws_iam_role.broker.arn }
+output "deployment_status" { value = "Infrastructure foundation only; no application service or distributed worker is deployed by this module." }

@@ -9,12 +9,15 @@ or a precomputed reachability index; the `resolve_path` contract stays the same.
 """
 
 from dataclasses import dataclass, field
-from fnmatch import fnmatch
+from fnmatch import fnmatchcase as fnmatch
+from collections import deque
+from datetime import datetime, timezone
+from .config import settings
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from .models import AccessEdge, AccessNode
+from .models import AccessEdge, AccessNode, RelationshipSource
 
 # Relations that transfer authority from a principal toward resources.
 TRAVERSABLE = {
@@ -91,17 +94,49 @@ def resolve_path(
     nodes = {n.id: n for n in db.scalars(select(AccessNode)).all() if in_tenant(n)}
     if start.id not in nodes or target.id not in nodes:
         return None
+    now = datetime.now(timezone.utc)
+    sources = {s.id: s for s in db.scalars(select(RelationshipSource)).all()}
+
+    def fresh(record):
+        if record.source_id is None:
+            return settings.demo_enabled
+        source = sources.get(record.source_id)
+        if source is None or not source.enabled:
+            return False
+        if record.tenant_id != source.tenant_id:
+            return False
+        for stamp in (record.observed_at, source.last_sync_at):
+            if stamp is None:
+                return False
+            if stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=timezone.utc)
+            if not 0 <= (now - stamp).total_seconds() <= settings.source_max_age_seconds:
+                return False
+        return True
+
+    nodes = {key: node for key, node in nodes.items() if fresh(node)}
+    if start.id not in nodes or target.id not in nodes:
+        return None
     out_edges: dict[str, list[AccessEdge]] = {}
-    for e in db.scalars(select(AccessEdge)).all():
-        if e.relation in TRAVERSABLE and e.src_id in nodes and e.dst_id in nodes:
+    edges = db.scalars(select(AccessEdge)).all()
+    unsupported_sources = {e.source_id for e in edges if e.source_id and (
+        e.attrs.get("conditions") or e.attrs.get("unsupported") or e.attrs.get("effect", "allow") != "allow")}
+    for e in edges:
+        if (e.relation in TRAVERSABLE and e.src_id in nodes and e.dst_id in nodes and fresh(e)
+                and e.source_id not in unsupported_sources and not e.attrs.get("conditions") and e.attrs.get("effect", "allow") == "allow"
+                and not e.attrs.get("unsupported")):
             out_edges.setdefault(e.src_id, []).append(e)
 
     # Breadth-first enumeration of simple paths (cycle check is per-path, not
     # global, so an alternate path that DOES confer the action is still found).
     MAX_DEPTH = 8
-    queue: list[tuple[str, list[AccessEdge]]] = [(start.id, [])]
+    queue = deque([(start.id, [])])
+    expanded = 0
     while queue:
-        node_id, trail = queue.pop(0)
+        expanded += 1
+        if expanded > 10000:
+            return None  # bounded search; no proof means no authority
+        node_id, trail = queue.popleft()
         if node_id == target.id:
             actions = sorted(
                 {a for e in trail if e.relation == "role_allows" for a in e.attrs.get("actions", [])}

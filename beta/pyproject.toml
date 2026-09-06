@@ -13,12 +13,15 @@ dependencies = [
     "sqlalchemy>=2.0",
     "pydantic>=2.6",
     "pyjwt[crypto]>=2.8",
+    "alembic>=1.13,<2",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "httpx>=0.27"]
+sdk = ["httpx>=0.27"]
+dev = ["pytest>=8", "httpx>=0.27", "hypothesis>=6,<7"]
 postgres = ["psycopg2-binary>=2.9"]
 aws = ["boto3>=1.34"]
+entra = ["azure-identity>=1.17", "httpx>=0.27"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

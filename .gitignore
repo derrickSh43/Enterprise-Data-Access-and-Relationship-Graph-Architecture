@@ -1,0 +1,38 @@
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.test-tmp*/
+
+*.db
+.hypothesis/
+.terraform/
+*.tfstate*
+*.tfplan
+*.tfvars
+!*.tfvars.example
+
+.env
+.env.*
+!.env.example
+
+sandbox/cli-policies/
+
+private-test-results/
+public-test-results/
+public-evidence/
+
+# Local incident-specific helper; contains operator/account details.
+sandbox/create-reader-role.ps1
+# Private key and credential material
+*.pem
+*.key
+*.pfx
+*.p12
+*.tfstate.*
+crash.log
+
+# Local audit/event exports are private by default.
+*.jsonl
+*.log

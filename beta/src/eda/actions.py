@@ -21,6 +21,7 @@ from sqlalchemy.orm import Session
 
 from . import broker as broker_mod
 from . import runner
+from .config import settings
 from .models import Grant
 
 
@@ -54,6 +55,7 @@ class ActionDef:
     risk: str                      # low | medium | high
     blast_radius: str
     resource_kinds: tuple          # object-graph kinds this action applies to; ("*",) = any
+    additional_cloud_actions: tuple = ()
     provider: str = "aws"
     input_model: type[BaseModel] = _NoInputs
     allowed_outputs: tuple = ()
@@ -125,6 +127,7 @@ REGISTRY: dict[str, ActionDef] = {
         ),
         ActionDef(
             name="inspect_instance",
+            additional_cloud_actions=("ec2:DescribeSecurityGroups",),
             description="Read-only investigation of an EC2 instance (incident workflow).",
             cloud_action="ec2:DescribeInstances",
             read_only=True,
@@ -224,11 +227,26 @@ def execute(
 ) -> dict:
     """Validate compatibility, inputs, and the grant, then run the handler -
     in-process for low-risk reads, inside the controlled runner otherwise."""
+    if settings.action_backend == "aws" and action.name not in {"inspect_instance", "view_asset"}:
+        raise ActionError("native write adapters are not yet qualified")
     check_compatibility(action, resource_kind)
     validated = validate_inputs(action, inputs)
     broker_mod.validate_grant(grant, action=action.cloud_action, resource=resource)
+    for required in action.additional_cloud_actions:
+        broker_mod.validate_grant(grant, action=required, resource=resource)
     credentials = broker_mod.fetch_credentials(grant)
 
+    if settings.action_backend == "aws" and action.name == "inspect_instance":
+        from .native_actions import inspect_instance
+        from .models import ObjectNode
+        from sqlalchemy import select
+        target = db.scalar(select(ObjectNode).where(ObjectNode.name == resource, ObjectNode.tenant_id == grant.tenant_id))
+        if target is None:
+            raise ActionError("native target metadata unavailable")
+        native_id = target.attrs.get("native_id", "").removeprefix("aws:")
+        outputs, calls = inspect_instance(credentials, native_id, settings.aws_region)
+        return {"action": action.name, "resource": resource, "execution_mode": "native_read",
+                "outputs": outputs, "api_calls": calls, "rollback": action.rollback, "blast_radius": action.blast_radius}
     controlled = action.risk == "high" or not action.read_only
     if controlled:
         try:

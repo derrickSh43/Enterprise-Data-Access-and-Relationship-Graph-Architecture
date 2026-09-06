@@ -31,7 +31,8 @@ from sqlalchemy.orm import Session
 from . import access_graph, actions, audit, broker, identity, objects, policy
 from .config import settings
 from .identity_providers import get_identity_provider, map_principal
-from .models import AccessNode, Approval, utcnow
+from .models import AccessNode, Approval, Execution, utcnow
+from . import execution
 
 
 def _inputs_hash(inputs: dict | None) -> str:
@@ -54,12 +55,18 @@ def handle_request(
     inputs: dict | None = None,
     justification: dict | None = None,
     approval_id: str | None = None,
+    idempotency_key: str | None = None,
 ) -> dict:
     correlation_id = uuid.uuid4().hex
     justification = justification or {}
     trace: dict = {"correlation_id": correlation_id, "stages": {}}
+    operation = None
 
     def finish(result: str, *, error: str | None = None, **audit_fields) -> dict:
+        if operation is not None:
+            operation.state = "succeeded" if result == "allowed" else "outcome_unknown"
+            operation.updated_at = utcnow()
+            operation.result = {"outcome": result, "error": error}
         audit.append(
             db,
             correlation_id=correlation_id,
@@ -133,7 +140,31 @@ def handle_request(
     path = access_graph.resolve_path(
         db, principal.name, action.cloud_action, resource, tenant=session.tenant
     )
+    additional_paths = [access_graph.resolve_path(db, principal.name, required, resource, tenant=session.tenant)
+                        for required in action.additional_cloud_actions]
+    if any(proof is None for proof in additional_paths):
+        path = None
     trace["stages"]["access_path"] = path.as_json() if path else None
+
+    # Bind approvals to current policy, action definition, inputs and justification.
+    try:
+        current_policy = policy.active_policy(db)
+    except policy.PolicyError as exc:
+        return finish("denied", error=str(exc), **base_audit)
+    request_hash = _inputs_hash({"subject": principal.name, "tenant": session.tenant,
+        "action": action.name, "handler": action.handler_path, "cloud_action": action.cloud_action,
+        "read_only": action.read_only, "risk": action.risk, "outputs": action.allowed_outputs,
+        "additional_actions": action.additional_cloud_actions,
+        "schema": action.input_model.model_json_schema(), "timeout": action.timeout_seconds,
+        "resource": resource, "inputs": validated_inputs, "justification": justification,
+        "policy_version": current_policy.version})
+    operation_key = execution.operation_id(session.tenant, principal.name, idempotency_key or correlation_id)
+    if not action.read_only:
+        existing = db.get(Execution, operation_key)
+        if existing is not None:
+            if existing.request_hash != request_hash:
+                return finish("denied", error="idempotency key conflicts with request or policy version", **base_audit)
+            return execution.replay(existing)
 
     # 4. Approval lookup: an approval is valid only for the exact request it
     # was created for (subject, action, resource, inputs), within its TTL,
@@ -145,7 +176,10 @@ def handle_request(
         and approval_record.subject == principal.name
         and approval_record.action == action_name
         and approval_record.resource == resource
-        and approval_record.inputs_hash == _inputs_hash(validated_inputs)
+        and approval_record.inputs_hash == request_hash
+        and approval_record.justification == justification
+        and access_graph.capability_path(db, approval_record.approver, approval_record.required_capability,
+                                         resource, tenant=session.tenant) is not None
         and approval_record.tenant_id == session.tenant
         and datetime.now(timezone.utc) <= _aware(approval_record.expires_at)
     )
@@ -188,7 +222,7 @@ def handle_request(
             subject=principal.name,
             action=action_name,
             resource=resource,
-            inputs_hash=_inputs_hash(validated_inputs),
+            inputs_hash=request_hash,
             required_capability=f"approval:{action_name}",  # server-derived, never client input
             justification=justification,
             expires_at=utcnow() + timedelta(seconds=settings.approval_ttl_seconds),
@@ -220,18 +254,26 @@ def handle_request(
                 **base_audit, **audit_policy,
             )
 
+    if not action.read_only:
+        operation = Execution(id=operation_key, tenant_id=session.tenant, subject=principal.name,
+                              request_hash=request_hash, policy_version=decision.policy_version,
+                              correlation_id=correlation_id, state="authorized")
+        db.add(operation)
+        audit.append(db, correlation_id=correlation_id, result="authorized", **base_audit, **audit_policy)
+        # Approval consumption and durable intent commit BEFORE broker or action effects.
+        db.commit()
+        trace["stages"]["execution"] = {"id": operation.id, "state": "authorized"}
+
     # 6. Authority Broker: temporary scoped grant
-    grant = broker.issue_grant(
-        db,
-        subject=principal.name,
-        action=action.cloud_action,
-        resource=resource,
-        obligations=decision.obligations,
-        session_tags={"session_id": session.session_id, "correlation_id": correlation_id,
-                      **session.tags},
-        correlation_id=correlation_id,
-        tenant_id=session.tenant,
-    )
+    try:
+        grant = broker.issue_grant(
+            db, subject=principal.name, action=action.cloud_action, resource=resource,
+            obligations=decision.obligations,
+            session_tags={**session.tags, "session_id": session.session_id, "correlation_id": correlation_id},
+            correlation_id=correlation_id, tenant_id=session.tenant, additional_actions=action.additional_cloud_actions,
+        )
+    except broker.GrantError as exc:
+        return finish("error", error=str(exc), **base_audit, **audit_policy)
     trace["stages"]["grant"] = broker.redacted(grant)
 
     # 7. Object Graph: scoped context, only now, with per-node disclosure
@@ -239,6 +281,21 @@ def handle_request(
     trace["stages"]["context"] = context
 
     # 8. Action Layer (controlled runner for writes/high risk)
+    if operation is not None:
+        operation.state = "running"
+        operation.updated_at = utcnow()
+        db.commit()
+        db.expire_all()
+        # A fresh lookup after commit catches revocation during approval/brokering.
+        fresh_session = get_identity_provider().verify(bearer_token)
+        if (map_principal(db, fresh_session) is None
+                or access_graph.resolve_path(db, principal.name, action.cloud_action, resource, tenant=session.tenant) is None
+                or policy.active_policy(db).version != decision.policy_version
+                or (approval_record is not None and (
+                    utcnow() > _aware(approval_record.expires_at)
+                    or access_graph.capability_path(db, approval_record.approver,
+                        approval_record.required_capability, resource, tenant=session.tenant) is None))):
+            return finish("error", error="authority changed before execution", **base_audit, **audit_policy)
     try:
         result = actions.execute(
             db, action=action, grant=grant, resource=resource,
@@ -248,6 +305,8 @@ def handle_request(
         return finish("error", error=str(exc), **base_audit, **audit_policy,
                       grant=broker.redacted(grant))
     trace["stages"]["action_result"] = result
+    if operation is not None:
+        trace["stages"]["execution"]["state"] = "succeeded"
 
     # 9. Audit the full chain
     return finish(

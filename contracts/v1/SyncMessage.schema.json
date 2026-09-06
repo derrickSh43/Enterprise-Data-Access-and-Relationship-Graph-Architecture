@@ -1,0 +1,177 @@
+{
+  "$defs": {
+    "ObjectRecord": {
+      "additionalProperties": false,
+      "properties": {
+        "ref": {
+          "$ref": "#/$defs/Reference"
+        },
+        "display_name": {
+          "maxLength": 300,
+          "minLength": 1,
+          "title": "Display Name",
+          "type": "string"
+        },
+        "observed_at": {
+          "format": "date-time",
+          "title": "Observed At",
+          "type": "string"
+        },
+        "attributes": {
+          "additionalProperties": true,
+          "title": "Attributes",
+          "type": "object"
+        }
+      },
+      "required": [
+        "ref",
+        "display_name",
+        "observed_at"
+      ],
+      "title": "ObjectRecord",
+      "type": "object"
+    },
+    "Reference": {
+      "additionalProperties": false,
+      "properties": {
+        "source_id": {
+          "maxLength": 120,
+          "minLength": 1,
+          "title": "Source Id",
+          "type": "string"
+        },
+        "native_id": {
+          "maxLength": 300,
+          "minLength": 1,
+          "title": "Native Id",
+          "type": "string"
+        },
+        "kind": {
+          "maxLength": 60,
+          "minLength": 1,
+          "title": "Kind",
+          "type": "string"
+        }
+      },
+      "required": [
+        "source_id",
+        "native_id",
+        "kind"
+      ],
+      "title": "Reference",
+      "type": "object"
+    },
+    "RelationshipRecord": {
+      "additionalProperties": false,
+      "properties": {
+        "subject": {
+          "$ref": "#/$defs/Reference"
+        },
+        "relation": {
+          "maxLength": 60,
+          "minLength": 1,
+          "title": "Relation",
+          "type": "string"
+        },
+        "target": {
+          "$ref": "#/$defs/Reference"
+        },
+        "observed_at": {
+          "format": "date-time",
+          "title": "Observed At",
+          "type": "string"
+        },
+        "attributes": {
+          "additionalProperties": true,
+          "title": "Attributes",
+          "type": "object"
+        }
+      },
+      "required": [
+        "subject",
+        "relation",
+        "target",
+        "observed_at"
+      ],
+      "title": "RelationshipRecord",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "protocol_version": {
+      "const": "1",
+      "default": "1",
+      "title": "Protocol Version",
+      "type": "string"
+    },
+    "sequence": {
+      "minimum": 1,
+      "title": "Sequence",
+      "type": "integer"
+    },
+    "operation": {
+      "enum": [
+        "begin",
+        "page",
+        "complete",
+        "abort",
+        "delta"
+      ],
+      "title": "Operation",
+      "type": "string"
+    },
+    "snapshot_id": {
+      "anyOf": [
+        {
+          "maxLength": 120,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Snapshot Id"
+    },
+    "objects": {
+      "items": {
+        "$ref": "#/$defs/ObjectRecord"
+      },
+      "maxItems": 1000,
+      "title": "Objects",
+      "type": "array"
+    },
+    "relationships": {
+      "items": {
+        "$ref": "#/$defs/RelationshipRecord"
+      },
+      "maxItems": 1000,
+      "title": "Relationships",
+      "type": "array"
+    },
+    "tombstones": {
+      "items": {
+        "type": "string"
+      },
+      "maxItems": 1000,
+      "title": "Tombstones",
+      "type": "array"
+    },
+    "coverage": {
+      "default": "partial",
+      "enum": [
+        "complete",
+        "partial"
+      ],
+      "title": "Coverage",
+      "type": "string"
+    }
+  },
+  "required": [
+    "sequence",
+    "operation"
+  ],
+  "title": "SyncMessage",
+  "type": "object"
+}

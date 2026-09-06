@@ -1,19 +1,4 @@
-"""Object / Ontology Graph: what things are and how they connect.
-
-Authority before context: this module refuses to answer without a validated
-grant. Authorization of the root object does NOT authorize everything
-connected to it - each returned node, edge, and field gets its own
-disclosure decision:
-
-- root node: full attributes (the grant covers it);
-- sensitive-classified neighbors one hop out: listed, attributes redacted;
-- sensitive-classified objects further out: omitted entirely, along with
-  their edges;
-- field-level: attribute keys named in a node's `restricted_fields` are
-  redacted on every non-root node;
-- tenant: objects belonging to a different tenant than the grant are
-  invisible (objects with no tenant are shared infrastructure).
-"""
+"""Object inventory with independent per-object and field disclosure checks."""
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -48,99 +33,80 @@ def relate(
     return edge
 
 
-def _is_sensitive(node: ObjectNode) -> bool:
-    return node.attrs.get("classification") == "sensitive"
-
-
-def _node_view(node: ObjectNode, *, is_root: bool, distance: int) -> dict | None:
-    """Per-node disclosure decision: full view, redacted view, or None (omit)."""
-    if is_root:
-        return {"kind": node.kind, "name": node.name, "attrs": node.attrs, "distance": 0}
-    if _is_sensitive(node):
-        if distance > 1:
-            return None  # connected is not authorized; too far to even list
-        return {
-            "kind": node.kind,
-            "name": node.name,
-            "classification": "sensitive",
-            "attrs": "REDACTED (sensitive; root-object authority does not extend here)",
-            "distance": distance,
-        }
-    restricted = set(node.attrs.get("restricted_fields", []))
-    attrs = {
-        k: ("REDACTED" if k in restricted else v)
-        for k, v in node.attrs.items()
-        if k != "restricted_fields"
-    }
-    return {"kind": node.kind, "name": node.name, "attrs": attrs, "distance": distance}
-
-
 def scoped_context(db: Session, *, grant: Grant, resource: str, max_hops: int = 2) -> dict:
-    """Return the neighborhood of `resource`, only under a validated grant,
-    with per-node/edge/field disclosure decisions applied."""
+    """Every root, neighbor, relationship and restricted field needs a live capability.
+
+    Action grants establish the investigation session, not disclosure authority.
+    No traversal through an undiscoverable object or undisclosable relationship.
+    """
+    from . import access_graph
     broker.validate_grant(grant, action=grant.scope["actions"][0], resource=resource)
+    if not 0 <= max_hops <= 4:
+        raise ValueError("context depth must be between 0 and 4")
+    empty = {"root": resource, "nodes": [], "edges": [], "note": "context unavailable"}
+    if not grant.tenant_id:
+        return empty
+    candidates = db.scalars(select(ObjectNode).where(ObjectNode.name == resource,
+                                                     ObjectNode.tenant_id == grant.tenant_id).limit(2)).all()
+    if len(candidates) != 1:
+        return empty
+    root = candidates[0]
+    checked = {}
 
-    root = get_object_by_name(db, resource)
-    if root is None:
-        return {"root": resource, "nodes": [], "edges": [], "note": "object not modeled"}
+    def permits(node, capability):
+        key = (node.id, capability)
+        if key not in checked:
+            checked[key] = access_graph.capability_path(db, grant.subject, capability, node.name,
+                                                        tenant=grant.tenant_id) is not None
+        return checked[key]
 
-    def tenant_visible(node: ObjectNode) -> bool:
-        return node.tenant_id is None or node.tenant_id == grant.tenant_id
-
-    nodes = {n.id: n for n in db.scalars(select(ObjectNode)).all() if tenant_visible(n)}
-    if root.id not in nodes:
-        return {"root": resource, "nodes": [], "edges": [], "note": "object not visible"}
-    adjacency: dict[str, list[ObjectEdge]] = {}
-    for e in db.scalars(select(ObjectEdge)).all():
-        if e.src_id in nodes and e.dst_id in nodes:
-            adjacency.setdefault(e.src_id, []).append(e)
-            adjacency.setdefault(e.dst_id, []).append(e)  # traverse both directions
-
-    # BFS with hop tracking for distance-based disclosure
+    if not permits(root, "context:discover"):
+        return empty
+    nodes = {root.id: root}
     distance = {root.id: 0}
     frontier = [root.id]
-    edges_seen: list[ObjectEdge] = []
+    visible_edges = {}
     for hop in range(1, max_hops + 1):
         next_frontier = []
         for node_id in frontier:
-            for e in adjacency.get(node_id, []):
-                other = e.dst_id if e.src_id == node_id else e.src_id
-                edges_seen.append(e)
-                if other not in distance:
-                    distance[other] = hop
-                    next_frontier.append(other)
+            from sqlalchemy import or_
+            edges = db.scalars(select(ObjectEdge).where(or_(ObjectEdge.src_id == node_id,
+                                                             ObjectEdge.dst_id == node_id)).limit(1001)).all()
+            if len(edges) > 1000:
+                raise ValueError("context expansion exceeds limit")
+            for edge in edges:
+                source = db.get(ObjectNode, edge.src_id)
+                target = db.get(ObjectNode, edge.dst_id)
+                if source is None or target is None:
+                    continue
+                if source.tenant_id != grant.tenant_id or target.tenant_id != grant.tenant_id:
+                    continue
+                if not permits(source, "context:discover") or not permits(target, "context:discover"):
+                    continue
+                if not permits(source, "context:relation:" + edge.relation):
+                    continue
+                other = target if source.id == node_id else source
+                visible_edges[edge.id] = {"src": f"{source.kind}:{source.name}", "relation": edge.relation,
+                                           "dst": f"{target.kind}:{target.name}"}
+                if other.id not in distance:
+                    distance[other.id] = hop
+                    nodes[other.id] = other
+                    next_frontier.append(other.id)
+                    if len(nodes) > 1000:
+                        raise ValueError("context exceeds object limit")
         frontier = next_frontier
-
-    # Per-node disclosure; omitted nodes (None) drop out along with their edges
-    views: dict[str, dict] = {}
-    for node_id, dist in distance.items():
-        view = _node_view(nodes[node_id], is_root=(node_id == root.id), distance=dist)
-        if view is not None:
-            views[node_id] = view
-
-    visible_edges = {
-        (e.src_id, e.relation, e.dst_id)
-        for e in edges_seen
-        if e.src_id in views and e.dst_id in views
-    }
-    edges_out = [
-        {
-            "src": f"{nodes[s].kind}:{nodes[s].name}",
-            "relation": r,
-            "dst": f"{nodes[d].kind}:{nodes[d].name}",
-        }
-        for (s, r, d) in sorted(
-            visible_edges, key=lambda t: (nodes[t[0]].name, t[1], nodes[t[2]].name)
-        )
-    ]
-
-    return {
-        "root": f"{root.kind}:{root.name}",
-        "nodes": [views[i] for i in sorted(views, key=lambda i: (distance[i], nodes[i].name))],
-        "edges": edges_out,
-        "scope": {
-            "max_hops": max_hops,
-            "read_only": grant.scope.get("read_only", False),
-            "disclosure": "per-node; sensitive neighbors redacted at 1 hop, omitted beyond",
-        },
-    }
+    views = []
+    for node_id in sorted(nodes, key=lambda key: (distance[key], nodes[key].name)):
+        node = nodes[node_id]
+        attrs = "REDACTED"
+        if permits(node, "context:read"):
+            restricted = set(node.attrs.get("restricted_fields", []))
+            # Secret material never belongs in a metadata graph, including roots.
+            restricted |= {"password", "secret", "secret_value", "token", "credentials", "private_key"}
+            attrs = {key: (value if key not in restricted or permits(node, "context:field:" + key) else "REDACTED")
+                     for key, value in node.attrs.items() if key != "restricted_fields"}
+        views.append({"kind": node.kind, "name": node.name, "attrs": attrs, "distance": distance[node_id]})
+    return {"root": f"{root.kind}:{root.name}", "nodes": views,
+            "edges": sorted(visible_edges.values(), key=lambda edge: (edge["src"], edge["relation"], edge["dst"])),
+            "scope": {"max_hops": max_hops, "read_only": grant.scope.get("read_only", False),
+                      "disclosure": "explicit discover/read/relation/field capabilities"}}

@@ -8,8 +8,9 @@ Credential handling:
   the same three methods.)
 - Provider credential lifetime never exceeds the grant lifetime the control
   plane enforces: brokers report the provider expiry and `issue_grant` rejects
-  any credential that would outlive its grant. Revoking a grant deletes the
-  vault entry, so expiration/revocation stay consistent across both systems.
+  any credential that would outlive its grant. Local revocation deletes the
+  vault entry; an already-issued provider credential may remain usable until
+  provider expiry. This implementation does not revoke AWS STS sessions.
 """
 
 import secrets
@@ -92,8 +93,10 @@ class AwsStsBroker(BaseBroker):
 
     kind = "aws_sts"
 
-    def __init__(self, role_arn: str):
+    def __init__(self, role_arn: str, *, region: str | None = None, sts_client=None):
         self.role_arn = role_arn
+        self.region = region
+        self.sts_client = sts_client
 
     def issue_credentials(self, *, subject: str, scope: dict, ttl_seconds: int, tags: dict):
         if ttl_seconds < 900:
@@ -107,15 +110,25 @@ class AwsStsBroker(BaseBroker):
             raise GrantError("boto3 not installed; pip install .[aws]") from exc
         import json
 
+        import hashlib
+        allowed_reads = {"ec2:DescribeInstances", "ec2:DescribeSecurityGroups"}
+        if not scope["actions"] or not set(scope["actions"]) <= allowed_reads:
+            raise GrantError("AWS adapter currently supports only declared EC2 inspection reads")
+        if not self.region:
+            raise GrantError("AWS inspection requires an explicit region")
+        # EC2 DescribeInstances cannot enforce a single-instance Resource ARN.
+        # The trusted handler pins instance IDs; native authority remains account/region scoped.
         session_policy = {
             "Version": "2012-10-17",
             "Statement": [
-                {"Effect": "Allow", "Action": scope["actions"], "Resource": scope["resources"]}
+                {"Effect": "Allow", "Action": scope["actions"], "Resource": "*",
+                 "Condition": {"StringEquals": {"aws:RequestedRegion": self.region}}}
             ],
         }
-        response = boto3.client("sts").assume_role(
+        response = (self.sts_client or boto3.client("sts", region_name=self.region)).assume_role(
             RoleArn=self.role_arn,
-            RoleSessionName=f"eda-{subject}"[:64],
+            RoleSessionName="eda-" + hashlib.sha256(subject.encode()).hexdigest()[:40],
+            SourceIdentity="eda-" + hashlib.sha256(subject.encode()).hexdigest()[:40],
             DurationSeconds=ttl_seconds,
             Policy=json.dumps(session_policy),
             Tags=[{"Key": k, "Value": str(v)} for k, v in tags.items()],
@@ -138,8 +151,10 @@ def issue_grant(
     correlation_id: str,
     tenant_id: str | None = None,
     broker: BaseBroker | None = None,
+    additional_actions: tuple[str, ...] = (),
 ) -> Grant:
-    broker = broker or _default_broker
+    broker = broker or (AwsStsBroker(settings.aws_role_arn, region=settings.aws_region)
+                        if settings.action_backend == "aws" else _default_broker)
     ttl = settings.grant_default_ttl_seconds
     read_only = False
     for o in obligations:
@@ -148,7 +163,7 @@ def issue_grant(
         if o["type"] == "read_only":
             read_only = True
 
-    scope = {"actions": [action], "resources": [resource], "read_only": read_only}
+    scope = {"actions": list(dict.fromkeys([action, *additional_actions])), "resources": [resource], "read_only": read_only}
     credentials, provider_expires_at = broker.issue_credentials(
         subject=subject, scope=scope, ttl_seconds=ttl, tags=session_tags
     )
@@ -201,10 +216,11 @@ def fetch_credentials(grant: Grant) -> dict:
     return vault.get(grant.credential_ref)
 
 
-def revoke_grant(grant: Grant) -> None:
-    """Revoke in both systems at once: control-plane flag + vault deletion."""
+def revoke_grant(grant: Grant) -> dict:
+    """Cancel local access. Already-issued provider sessions are NOT revoked."""
     grant.revoked = True
     vault.revoke(grant.credential_ref)
+    return {"local_revoked": True, "provider_revoked": False, "provider_valid_until": grant.expires_at.isoformat()}
 
 
 def redacted(grant: Grant) -> dict:

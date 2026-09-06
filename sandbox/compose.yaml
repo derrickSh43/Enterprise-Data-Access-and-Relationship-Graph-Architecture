@@ -1,0 +1,77 @@
+name: eda-sandbox
+x-eda: &eda
+  build:
+    context: ..
+    dockerfile: deploy/Dockerfile
+  environment: &settings
+    EDA_ENV: dev
+    EDA_AUTH_MODE: oidc
+    EDA_ACTION_BACKEND: mock
+    EDA_DATABASE_URL: postgresql+psycopg2://eda:${POSTGRES_PASSWORD:?Generate a URL-safe password}@database:5432/eda
+    EDA_OIDC_ISSUER: https://login.microsoftonline.com/${ENTRA_TENANT_ID:?Set tenant ID}/v2.0
+    EDA_OIDC_JWKS_URL: https://login.microsoftonline.com/${ENTRA_TENANT_ID:?Set tenant ID}/discovery/v2.0/keys
+    EDA_OIDC_AUDIENCE: ${EDA_OIDC_AUDIENCE:?Set API client ID}
+    EDA_OIDC_STATIC_TENANT: ${ENTRA_TENANT_ID:?Set tenant ID}
+    EDA_OIDC_TENANT_CLAIM: tid
+    EDA_OIDC_EXTERNAL_ID_CLAIM: oid
+    EDA_OIDC_PROVIDER_PREFIX: entra
+    EDA_OIDC_NATIVE_ID_PREFIX: 'entra:'
+    EDA_OIDC_DIRECTORY_SOURCE: entra-sandbox
+    EDA_SOURCE_MAX_AGE: '900'
+    EDA_AUDIT_ANCHOR_KEY: ${EDA_AUDIT_ANCHOR_KEY:?Generate a 32-byte hex key}
+    EDA_AUDIT_TRUSTED_KEYS: ${EDA_AUDIT_TRUSTED_KEYS:?Set matching public key}
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+services:
+  database:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: eda
+      POSTGRES_USER: eda
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Generate a URL-safe password}
+    volumes: [database:/var/lib/postgresql/data]
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U eda -d eda']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+  migrate:
+    <<: *eda
+    command: [python, -m, alembic, upgrade, head]
+    depends_on:
+      database: {condition: service_healthy}
+  api:
+    <<: *eda
+    ports: ['127.0.0.1:8000:8000']
+    volumes: [evidence:/data]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/readyz', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+  sync:
+    <<: *eda
+    profiles: [tools]
+    command: [python, /sandbox/sync.py]
+    environment:
+      <<: *settings
+      ENTRA_TENANT_ID: ${ENTRA_TENANT_ID}
+      ENTRA_LOGIN_CLIENT_ID: ${ENTRA_LOGIN_CLIENT_ID:-}
+      ENTRA_LOGIN_SCOPE: ${ENTRA_LOGIN_SCOPE:-}
+      ENTRA_COLLECTOR_CLIENT_ID: ${ENTRA_COLLECTOR_CLIENT_ID:-}
+      ENTRA_COLLECTOR_CLIENT_SECRET: ${ENTRA_COLLECTOR_CLIENT_SECRET:-}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      AWS_EXPECTED_ACCOUNT: ${AWS_EXPECTED_ACCOUNT:-}
+      AWS_COLLECTOR_ROLE_ARN: ${AWS_COLLECTOR_ROLE_ARN:-}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+      AWS_EC2_METADATA_DISABLED: 'true'
+    volumes: ['./sync.py:/sandbox/sync.py:ro', './check-login.py:/sandbox/check-login.py:ro']
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+volumes:
+  database:
+  evidence:

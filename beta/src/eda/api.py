@@ -12,11 +12,12 @@ Docs: http://127.0.0.1:8000/docs
 """
 
 import threading
+import uuid
 from collections import Counter
 from contextlib import asynccontextmanager
 from datetime import datetime
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 from sqlalchemy import or_, select, text
 from sqlalchemy.orm import Session
@@ -67,11 +68,14 @@ def _admin(db: Session, authorization: str | None, capability: str):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    settings.validate()
+    get_identity_provider()
     init_db()
     from .db import SessionLocal
 
-    with SessionLocal() as db:
-        seed(db)
+    if settings.demo_enabled:
+        with SessionLocal() as db:
+            seed(db)
     yield
 
 
@@ -130,7 +134,7 @@ class SessionRequest(BaseModel):
 
 @app.post("/identity/sessions", tags=["identity"])
 def create_session(body: SessionRequest):
-    if settings.auth_mode != "dev":
+    if not settings.demo_enabled:
         raise HTTPException(403, "self-issued sessions are disabled outside dev mode")
     token = identity.issue_session(
         body.subject, mfa=body.mfa, risk_score=body.risk_score, tags=body.tags
@@ -256,6 +260,7 @@ class GovernedRequest(BaseModel):
 @app.post("/requests", tags=["requests"])
 def submit_request(
     body: GovernedRequest,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key", max_length=200),
     db: Session = Depends(get_session),
     authorization: str | None = Header(default=None),
 ):
@@ -267,6 +272,7 @@ def submit_request(
         inputs=body.inputs,
         justification=body.justification,
         approval_id=body.approval_id,
+        idempotency_key=idempotency_key,
     )
 
 
@@ -338,6 +344,87 @@ def ingest_relationships(
         db.rollback()
         raise HTTPException(exc.status, exc.detail)
     return summary
+
+
+# ---- Versioned connector synchronization -------------------------------------
+from .connectors.contracts import Manifest, SyncMessage
+from .connectors import sync as connector_sync
+
+
+class SourceRegistration(BaseModel):
+    model_config = {"extra": "forbid"}
+    source_id: str = Field(pattern=r"^[A-Za-z0-9_-]{1,120}$")
+    provider: str = Field(min_length=1, max_length=60)
+    allowed_namespace: str = Field(max_length=300)
+
+
+@app.post("/relationship-sources", tags=["ingestion"], status_code=201)
+def create_relationship_source(body: SourceRegistration, response: Response,
+                               db: Session = Depends(get_session),
+                               authorization: str | None = Header(default=None)):
+    principal = _admin(db, authorization, "admin:access-graph:write")
+    try:
+        source, secret = ingestion.register_source(db, source_id=body.source_id,
+            tenant_id=principal.tenant_id, provider=body.provider,
+            allowed_namespace=body.allowed_namespace)
+        audit.append(db, correlation_id=uuid.uuid4().hex,
+                     subject=principal.name, session_id="-", event="source_registration",
+                     action="register_source", target=source.id, result="accepted",
+                     tenant_id=principal.tenant_id, context_summary={"provider": body.provider})
+        db.commit()
+        response.headers["Cache-Control"] = "no-store"
+        return {"source_id": source.id, "collector_token": secret}
+    except ingestion.IngestError as exc:
+        db.rollback()
+        # Avoid disclosing whether another tenant owns the requested source ID.
+        raise HTTPException(exc.status, "source identifier unavailable")
+
+
+@app.get("/relationship-sources/{source_id}/sync-state", tags=["ingestion"])
+def connector_sync_state(source_id: str, response: Response,
+                         db: Session = Depends(get_session),
+                         authorization: str | None = Header(default=None)):
+    from .models import ConnectorState
+    try:
+        source = ingestion.authenticate_collector(db, source_id, _bearer(authorization))
+        state = db.get(ConnectorState, source.id)
+        if state is None:
+            raise HTTPException(409, "connector manifest not registered")
+        response.headers["Cache-Control"] = "no-store"
+        return {"source_id": source.id, "sequence": state.sequence,
+                "snapshot_id": state.snapshot_id, "coverage": state.coverage}
+    except ingestion.IngestError as exc:
+        raise HTTPException(exc.status, exc.detail)
+
+
+@app.post("/relationship-sources/{source_id}/manifest", tags=["ingestion"])
+def register_manifest(source_id: str, body: Manifest, db: Session = Depends(get_session),
+                      authorization: str | None = Header(default=None)):
+    principal = _admin(db, authorization, "admin:access-graph:write")
+    from .models import RelationshipSource
+    source = db.get(RelationshipSource, source_id)
+    if source is None or source.tenant_id != principal.tenant_id:
+        raise HTTPException(404, "source unavailable")
+    try:
+        connector_sync.register(db, source, body)
+        db.commit()
+        return {"source_id": source_id, "registered": True}
+    except ingestion.IngestError as exc:
+        db.rollback()
+        raise HTTPException(exc.status, exc.detail)
+
+
+@app.post("/relationship-sources/{source_id}/sync", tags=["ingestion"])
+def sync_connector(source_id: str, body: SyncMessage, db: Session = Depends(get_session),
+                   authorization: str | None = Header(default=None)):
+    try:
+        source = ingestion.authenticate_collector(db, source_id, _bearer(authorization))
+        result = connector_sync.apply_message(db, source, body)
+        db.commit()
+        return result
+    except ingestion.IngestError as exc:
+        db.rollback()
+        raise HTTPException(exc.status, exc.detail)
 
 
 # ---- Audit / Evidence (admin, tenant-scoped) ------------------------------------

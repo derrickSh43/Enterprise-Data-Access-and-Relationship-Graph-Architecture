@@ -1,0 +1,5 @@
+expected_account_id = "123456789012"
+trusted_principal_arn = "arn:aws:iam::123456789012:role/REPLACE-WITH-LOCAL-LOGIN-ROLE"
+region = "us-east-1"
+name = "eda-sandbox"
+run_instance = false

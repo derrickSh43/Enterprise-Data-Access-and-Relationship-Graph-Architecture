@@ -14,7 +14,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from .config import settings
@@ -60,6 +60,9 @@ def _ts_iso(ts: datetime | None) -> str | None:
 
 def _record_hash(record: AuditRecord, prev_hash: str) -> str:
     payload = {f: getattr(record, f) for f in _CHAINED_FIELDS}
+    if (record.hash_version or 1) >= 2:
+        payload["hash_version"] = record.hash_version
+        payload["tenant_id"] = record.tenant_id
     payload["ts"] = _ts_iso(record.ts)
     payload["prev_hash"] = prev_hash
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
@@ -69,10 +72,13 @@ def _record_hash(record: AuditRecord, prev_hash: str) -> str:
 def append(db: Session, **fields) -> AuditRecord:
     """Append one fully-formed record: predecessor lookup, hashing, and
     insert happen atomically under the chain lock."""
+    if db.get_bind().dialect.name == "postgresql":
+        db.execute(text("SELECT pg_advisory_xact_lock(518340921)"))
     with _append_lock:
         prev = db.scalar(select(AuditRecord).order_by(AuditRecord.seq.desc()))
         record = AuditRecord(
             id=uuid.uuid4().hex,
+            hash_version=2,
             ts=datetime.now(timezone.utc),
             prev_hash=prev.hash if prev else GENESIS,
             hash="",
@@ -149,14 +155,42 @@ def verify_anchors(db: Session) -> dict:
 
     path = Path(settings.audit_anchor_path)
     if not path.exists():
-        return {"ok": True, "anchors": 0, "failures": []}
+        return {"ok": False, "anchors": 0, "failures": [{"reason": "anchor storage missing"}]}
 
     by_seq = {
         r.seq: r.hash for r in db.scalars(select(AuditRecord)).all()
     }
     failures = []
-    anchors = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+    trusted = set(filter(None, (key.strip() for key in settings.audit_trusted_public_keys.split(","))))
+    if not trusted and settings.demo_enabled:
+        # Development trust comes from this process, never the untrusted file.
+        trusted = {_anchor_key().public_key().public_bytes(Encoding.Raw, PublicFormat.Raw).hex()}
+    try:
+        anchors = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+    except (ValueError, OSError):
+        return {"ok": False, "anchors": 0, "failures": [{"reason": "unreadable anchor storage"}]}
+    if not anchors:
+        return {"ok": False, "anchors": 0, "failures": [{"reason": "anchor storage empty"}]}
+    previous_seq = 0
+    latest_at = None
     for i, anchor in enumerate(anchors):
+        if not isinstance(anchor, dict) or not {"seq", "hash", "anchored_at", "signature", "public_key"} <= anchor.keys():
+            failures.append({"anchor": i, "reason": "malformed anchor"})
+            continue
+        if anchor["public_key"] not in trusted:
+            failures.append({"anchor": i, "reason": "untrusted signing key"})
+            continue
+        try:
+            observed = datetime.fromisoformat(anchor["anchored_at"])
+            if observed.tzinfo is None or type(anchor["seq"]) is not int or anchor["seq"] < previous_seq:
+                raise ValueError("invalid anchor order")
+            if latest_at is not None and observed < latest_at:
+                raise ValueError("anchor clock moved backward")
+            latest_at, previous_seq = observed, anchor["seq"]
+        except (ValueError, TypeError):
+            failures.append({"anchor": i, "reason": "invalid anchor time or sequence"})
+            continue
         payload = {"seq": anchor["seq"], "hash": anchor["hash"],
                    "anchored_at": anchor["anchored_at"]}
         canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
@@ -164,9 +198,13 @@ def verify_anchors(db: Session) -> dict:
             Ed25519PublicKey.from_public_bytes(bytes.fromhex(anchor["public_key"])).verify(
                 bytes.fromhex(anchor["signature"]), canonical.encode()
             )
-        except (InvalidSignature, ValueError):
+        except (InvalidSignature, ValueError, TypeError):
             failures.append({"anchor": i, "reason": "invalid signature"})
             continue
         if by_seq.get(anchor["seq"]) != anchor["hash"]:
             failures.append({"anchor": i, "reason": "chain no longer matches anchored head"})
+    if previous_seq < settings.audit_anchor_min_seq:
+        failures.append({"reason": "anchor below independent minimum sequence"})
+    if latest_at is None or not 0 <= (datetime.now(timezone.utc) - latest_at).total_seconds() <= settings.audit_anchor_max_age:
+        failures.append({"reason": "anchor missing, stale or in the future"})
     return {"ok": not failures, "anchors": len(anchors), "failures": failures}

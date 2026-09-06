@@ -1,0 +1,80 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "protocol_version": {
+      "const": "1",
+      "default": "1",
+      "title": "Protocol Version",
+      "type": "string"
+    },
+    "connector_type": {
+      "maxLength": 120,
+      "minLength": 1,
+      "title": "Connector Type",
+      "type": "string"
+    },
+    "object_kinds": {
+      "items": {
+        "type": "string"
+      },
+      "maxItems": 100,
+      "minItems": 1,
+      "title": "Object Kinds",
+      "type": "array"
+    },
+    "relations": {
+      "items": {
+        "type": "string"
+      },
+      "maxItems": 100,
+      "title": "Relations",
+      "type": "array"
+    },
+    "capabilities": {
+      "items": {
+        "enum": [
+          "snapshot",
+          "changes",
+          "context",
+          "permissions"
+        ],
+        "type": "string"
+      },
+      "title": "Capabilities",
+      "type": "array"
+    },
+    "foreign_references": {
+      "additionalProperties": {
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "title": "Foreign References",
+      "type": "object"
+    },
+    "permission_semantics": {
+      "default": "inventory_only",
+      "enum": [
+        "inventory_only",
+        "platform_relations"
+      ],
+      "title": "Permission Semantics",
+      "type": "string"
+    },
+    "limitations": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Limitations",
+      "type": "array"
+    }
+  },
+  "required": [
+    "connector_type",
+    "object_kinds",
+    "capabilities"
+  ],
+  "title": "Manifest",
+  "type": "object"
+}

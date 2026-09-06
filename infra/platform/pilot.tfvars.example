@@ -1,0 +1,9 @@
+region = "us-east-1"
+name = "eda-pilot"
+vpc_id = "vpc-REPLACE"
+private_subnet_ids = ["subnet-REPLACE1", "subnet-REPLACE2"]
+application_security_group_id = "sg-REPLACE"
+audit_bucket_name = "replace-with-globally-unique-audit-bucket"
+final_snapshot_identifier = "eda-pilot-final-unique"
+production_profile = false
+target_role_arns = []

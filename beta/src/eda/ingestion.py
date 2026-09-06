@@ -22,7 +22,7 @@ from sqlalchemy.orm import Session
 from . import audit
 from .access_graph import TRAVERSABLE
 from .config import settings
-from .models import AccessEdge, AccessNode, IngestReceipt, RelationshipSource
+from .models import AccessEdge, AccessNode, IngestReceipt, RelationshipSource, ConnectorState
 
 ALLOWED_KINDS = {"user", "group", "role", "permission_set", "service_account", "account", "asset"}
 ALLOWED_RELATIONS = set(TRAVERSABLE)
@@ -87,6 +87,8 @@ def _validate(source: RelationshipSource, relationships: list[dict], max_batch: 
     if len(relationships) > max_batch:
         errors.append(f"batch of {len(relationships)} exceeds limit {max_batch}")
         return errors
+    if not source.enabled:
+        errors.append("source disabled")
     ns = source.allowed_namespace
     for i, rel in enumerate(relationships):
         where = f"relationships[{i}]"
@@ -140,6 +142,8 @@ def _upsert_node(
             db.add(node)
             db.flush()
         cache[external_id] = node
+    if node.source_id != source.id:
+        raise IngestError(403, "source cannot overwrite another source node")
     if node.kind != kind:
         raise IngestError(
             422, f"{external_id!r} already exists as kind {node.kind!r}, not {kind!r}"
@@ -158,11 +162,15 @@ def ingest(
     max_batch: int | None = None,
 ) -> dict:
     """Validate then apply a relationship batch atomically. Caller commits."""
+    if db.get(ConnectorState, source.id):
+        raise IngestError(409, "versioned connector must use sync endpoint")
     errors = _validate(source, relationships, max_batch or settings.ingest_max_batch)
     if errors:
         raise IngestError(422, errors)
 
     observed_at = observed_at or datetime.now(timezone.utc)
+    if observed_at.tzinfo is None or observed_at > datetime.now(timezone.utc):
+        raise IngestError(422, "observation time must be timezone-aware and not in the future")
     cache: dict[str, AccessNode] = {}
     nodes_created = edges_created = edges_updated = 0
 

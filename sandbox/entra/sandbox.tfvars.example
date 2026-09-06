@@ -1,0 +1,6 @@
+tenant_id = "REPLACE-WITH-EXISTING-TEST-TENANT-UUID"
+name = "eda-sandbox"
+# Existing test users in that tenant. This does not create user accounts.
+test_user_object_ids = []
+# Choose a short FUTURE expiry when you run this.
+collector_secret_expires_at = "2026-10-06T00:00:00Z"

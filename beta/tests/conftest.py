@@ -2,6 +2,7 @@ import os
 
 # Must be set before any eda import: eda.db builds its engine from this at import time.
 os.environ["EDA_DATABASE_URL"] = "sqlite:///./test_eda.db"
+os.environ["EDA_ENV"] = "test"
 os.environ["EDA_AUTH_MODE"] = "dev"  # dev sessions are test/demo-only by design
 
 import pytest  # noqa: E402

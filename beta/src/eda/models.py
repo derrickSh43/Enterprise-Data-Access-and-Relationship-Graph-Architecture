@@ -200,6 +200,8 @@ class Approval(Base):
 class AuditRecord(Base):
     __tablename__ = "audit_records"
 
+    hash_version: Mapped[int] = mapped_column(Integer, default=2, server_default="1")
+
     seq: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     id: Mapped[str] = mapped_column(String(32), unique=True, default=_uuid)
     correlation_id: Mapped[str] = mapped_column(String(32), index=True)
@@ -254,3 +256,50 @@ class IngestReceipt(Base):
     idempotency_key: Mapped[str] = mapped_column(String(200))
     summary: Mapped[dict] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+# Connector sync uses separate tables, so existing prototype tables need no
+# destructive conversion. Versioned migrations must create these before use.
+class ConnectorState(Base):
+    __tablename__ = "connector_states"
+    source_id: Mapped[str] = mapped_column(String(120), primary_key=True)
+    manifest: Mapped[dict] = mapped_column(JSON)
+    sequence: Mapped[int] = mapped_column(Integer, default=0)
+    snapshot_id: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    coverage: Mapped[str] = mapped_column(String(20), default="partial")
+
+
+class ConnectorFact(Base):
+    __tablename__ = "connector_facts"
+    __table_args__ = (UniqueConstraint("source_id", "fact_key", "generation"),)
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    source_id: Mapped[str] = mapped_column(String(120), index=True)
+    fact_key: Mapped[str] = mapped_column(String(80), index=True)
+    generation: Mapped[str] = mapped_column(String(120), default="live")
+    kind: Mapped[str] = mapped_column(String(20))
+    payload: Mapped[dict] = mapped_column(JSON)
+
+
+class ConnectorReceipt(Base):
+    __tablename__ = "connector_receipts"
+    __table_args__ = (UniqueConstraint("source_id", "sequence"),)
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    source_id: Mapped[str] = mapped_column(String(120), index=True)
+    sequence: Mapped[int] = mapped_column(Integer)
+    digest: Mapped[str] = mapped_column(String(64))
+    result: Mapped[dict] = mapped_column(JSON)
+
+
+
+class Execution(Base):
+    __tablename__ = "executions"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(120), index=True)
+    subject: Mapped[str] = mapped_column(String(200))
+    request_hash: Mapped[str] = mapped_column(String(64))
+    policy_version: Mapped[str] = mapped_column(String(60))
+    correlation_id: Mapped[str] = mapped_column(String(32), index=True)
+    state: Mapped[str] = mapped_column(String(30), default="authorized")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    result: Mapped[dict | None] = mapped_column(JSON, nullable=True)

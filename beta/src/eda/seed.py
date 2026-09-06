@@ -120,6 +120,19 @@ def seed(db: Session) -> None:
     og.relate(db, incident, "tracks", finding)
     og.relate(db, app, "owned_by", team)
 
+    # Explicit demo disclosure grants: business ownership/adjacency grants nothing.
+    context_role = ag.add_node(db, "role", "context-reader")
+    ag.add_edge(db, group, "can_assume", context_role)
+    from .models import ObjectNode, ObjectEdge
+    for node in db.scalars(select(ObjectNode)).all():
+        asset = ag.get_node(db, "asset", node.name) or ag.add_node(db, "asset", node.name)
+        if node.attrs.get("classification") == "sensitive":
+            continue
+        capabilities = ["context:discover", "context:read"]
+        capabilities += ["context:relation:" + edge.relation for edge in db.scalars(
+            select(ObjectEdge).where(ObjectEdge.src_id == node.id)).all()]
+        ag.add_edge(db, context_role, "role_allows", asset, {"actions": capabilities})
+
     # ---- Policy: install the default versioned policy document -------------
     policy.active_policy(db)
     db.commit()
